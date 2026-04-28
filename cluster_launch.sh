@@ -82,7 +82,7 @@ for i in "${!NODES[@]}"; do
         else
             tmux new-session -d -s vllm-server -x 220 -y 50 2>/dev/null || true
             tmux send-keys -t vllm-server \
-                'vllm serve $VLLM_MODEL \
+                '/home/nvidia/.local/bin/vllm serve $VLLM_MODEL \
                     --port 8080 \
                     --enable-auto-tool-choice \
                     --tool-call-parser qwen3_xml \
