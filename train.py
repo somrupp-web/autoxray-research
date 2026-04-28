@@ -101,6 +101,10 @@ total_seconds    = time.time() - t_start
 
 val_auc = evaluate_auc(model, val_loader, device)
 
+# Save model weights for test inference
+_model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trained_model.pth')
+torch.save(model.state_dict(), _model_path)
+
 print('---')
 print(f'val_auc:          {val_auc:.6f}')
 print(f'training_seconds: {training_seconds:.1f}')

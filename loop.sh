@@ -98,9 +98,17 @@ push_results() {
     }
 }
 
+# ── original baseline commit for train.py ─────────────────────
+ORIG_COMMIT=$(git log --oneline -- train.py | tail -1 | awk '{print $1}')
+log "Baseline train.py commit: $ORIG_COMMIT"
+
 # ── main loop ─────────────────────────────────────────────────
 for iter in $(seq 1 "$MAX_ITER"); do
     log "══════ Iteration $iter / $MAX_ITER ══════"
+
+    # Always start each iteration from the original unmodified train.py
+    git show "$ORIG_COMMIT":train.py > train.py
+    log "Reset train.py to original baseline."
 
     sync_global_results
 
@@ -165,7 +173,7 @@ IMPORTANT: Use bash to write the file (step 5). Do NOT use the edit tool."
     log "Committed $COMMIT"
 
     log "Training (10-min budget)..."
-    $UV run train.py > run.log 2>&1
+    $UV run train.py 2>&1 | tee run.log
     log "Training complete."
 
     VAL_AUC=$(grep "^val_auc:"      run.log | awk '{print $2}')
@@ -197,6 +205,11 @@ except: print('no')
 
     $UV run "$REPO_DIR/plot_results.py" results.tsv results_chart.png 2>/dev/null \
         && log "Chart updated."
+
+    log "Running test inference on sample X-ray..."
+    $UV run "$REPO_DIR/test_inference.py" > /tmp/infer_out.txt 2>&1 \
+        && log "Test inference complete." \
+        || log "WARNING: test inference failed — check /tmp/infer_out.txt"
 
     push_results
     log "Pushed to origin/$BRANCH"
