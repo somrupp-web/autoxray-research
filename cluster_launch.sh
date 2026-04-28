@@ -117,7 +117,7 @@ for i in "${!NODES[@]}"; do
         tmux kill-session -t '$SESSION' 2>/dev/null || true
         tmux new-session -d -s '$SESSION' -x 220 -y 50
         tmux send-keys -t '$SESSION' \
-            'cd $REPO_DIR && NODE_ID=$i ./loop.sh $MAX_ITER 2>&1 | tee loop_node${i}.log' Enter
+            'cd $REPO_DIR && CLUSTER_SIZE=${#NODES[@]} NODE_ID=$i ./loop.sh $MAX_ITER 2>&1 | tee loop_node${i}.log' Enter
     " && log "  node-$i: loop started (tmux session: $SESSION) ✓"
 done
 

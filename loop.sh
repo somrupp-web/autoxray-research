@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
-# Autonomous X-ray Research Loop — multi-node edition
-# Each node runs independently; results are synced via git.
+# Autonomous X-ray Research Loop
 #
-# Usage:
-#   NODE_ID=0 ./loop.sh [max_iterations]
-#   NODE_ID=1 ./loop.sh [max_iterations]
-#   ...
+# Single-node usage  (default):
+#   ./loop.sh [max_iterations]
+#
+# Cluster usage  (set by cluster_launch.sh automatically):
+#   CLUSTER_SIZE=4 NODE_ID=0 ./loop.sh [max_iterations]
 # ============================================================
 
 REPO_DIR="/home/nvidia/autoresearch"
@@ -15,12 +15,27 @@ OPENCODE=$(find /home/nvidia/.local/share/fnm -name opencode -type f 2>/dev/null
 MODEL="vllm//home/nvidia/models/Qwen3.5-122B-A10B-AWQ"
 MAX_ITER="${1:-20}"
 NODE_ID="${NODE_ID:-0}"
+CLUSTER_SIZE="${CLUSTER_SIZE:-1}"          # 1 = single node, 4 = cluster
 BRANCH="node-${NODE_ID}"
-NODES=(0 1 2 3)   # all branch names to sync from
+NODES=(0 1 2 3)
 
 cd "$REPO_DIR"
 
 log() { echo "[$(date '+%H:%M:%S')] [node-${NODE_ID}] $*"; }
+
+# ── Mode banner ───────────────────────────────────────────────
+echo ""
+echo "╔══════════════════════════════════════════════════════╗"
+if [ "$CLUSTER_SIZE" -gt 1 ]; then
+    echo "║  MODE : CLUSTER  (node ${NODE_ID} of $((CLUSTER_SIZE-1)), ${CLUSTER_SIZE} nodes total)         ║"
+    echo "║  SYNC : git branch ${BRANCH}  →  GitHub             ║"
+else
+    echo "║  MODE : SINGLE NODE                                  ║"
+    echo "║  SYNC : local only  (no git push/fetch)              ║"
+fi
+echo "║  ITER : ${MAX_ITER} iterations  ·  10-min training budget    ║"
+echo "╚══════════════════════════════════════════════════════╝"
+echo ""
 
 # ── prerequisites ─────────────────────────────────────────────
 [ -z "$OPENCODE" ] && { log "ERROR: opencode binary not found"; exit 1; }
@@ -29,12 +44,14 @@ log "Model    : $MODEL"
 log "Branch   : $BRANCH"
 log "Max iter : $MAX_ITER"
 
-# ── checkout node branch (create if first run) ────────────────
-git fetch origin 2>/dev/null || true
-if git show-ref --quiet "refs/remotes/origin/$BRANCH"; then
-    git checkout -B "$BRANCH" "origin/$BRANCH" 2>/dev/null || git checkout "$BRANCH"
-else
-    git checkout -B "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+# ── checkout node branch (cluster only) ──────────────────────
+if [ "$CLUSTER_SIZE" -gt 1 ]; then
+    git fetch origin 2>/dev/null || true
+    if git show-ref --quiet "refs/remotes/origin/$BRANCH"; then
+        git checkout -B "$BRANCH" "origin/$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+    else
+        git checkout -B "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+    fi
 fi
 
 # ── wait for vLLM on this node ────────────────────────────────
@@ -46,8 +63,13 @@ done
 curl -sf http://127.0.0.1:8080/v1/models > /dev/null 2>&1 || { log "ERROR: vLLM not ready. Abort."; exit 1; }
 
 # ── sync: pull results from all node branches into results.tsv ──
-# Builds a deduplicated view of all experiments across the cluster.
+# In cluster mode: merges all node branches from GitHub.
+# In single-node mode: no-op (results.tsv is already local).
 sync_global_results() {
+    if [ "$CLUSTER_SIZE" -le 1 ]; then
+        log "Single-node mode — skipping cluster sync."
+        return
+    fi
     git fetch origin 2>/dev/null || true
     > /tmp/global_results.tsv
     for n in "${NODES[@]}"; do
@@ -55,17 +77,18 @@ sync_global_results() {
             | grep -v '^commit' \
             >> /tmp/global_results.tsv || true
     done
-    # Include local unsynchronised rows
     grep -v '^commit' results.tsv 2>/dev/null >> /tmp/global_results.tsv || true
-    # Deduplicate by commit hash, restore header
     sort -u -k1,1 /tmp/global_results.tsv \
         | { printf 'commit\tval_auc\tmemory_gb\tstatus\tdescription\n'; cat; } \
         > results.tsv
     log "Synced: $(grep -c 'keep\|discard' results.tsv 2>/dev/null || echo 0) total experiments across cluster."
 }
 
-# ── push local results to origin ─────────────────────────────
+# ── push local results to origin (cluster only) ──────────────
 push_results() {
+    if [ "$CLUSTER_SIZE" -le 1 ]; then
+        return   # single-node: nothing to push
+    fi
     git add results.tsv results_chart.png 2>/dev/null || true
     git diff --cached --quiet || \
         git commit -m "node-${NODE_ID}: results sync after iter-${iter}"
@@ -86,16 +109,21 @@ for iter in $(seq 1 "$MAX_ITER"); do
     TRIED=$(grep -c 'keep\|discard' results.tsv 2>/dev/null || echo 0)
     log "Global best val_auc=$BEST_AUC  |  Total experiments=$TRIED"
 
-    PROMPT="You are AI research agent node-${NODE_ID} on a 4-node NVIDIA DGX Spark cluster.
+    if [ "$CLUSTER_SIZE" -gt 1 ]; then
+        CONTEXT="You are AI research agent node-${NODE_ID} running on a ${CLUSTER_SIZE}-node NVIDIA DGX Spark cluster.
+NOTE: $((CLUSTER_SIZE-1)) other agents are running simultaneously. results.tsv contains ALL nodes'
+experiments — check it carefully and choose a technique not yet tried by any agent."
+    else
+        CONTEXT="You are an AI research agent running on a single NVIDIA DGX Spark."
+    fi
 
-Your goal: improve chest X-ray disease classification. Global best val_auc=${BEST_AUC}.
-NOTE: 3 other agents (node-0 to node-3) are running simultaneously on the same cluster.
-Check results.tsv carefully — it contains ALL nodes' experiments. Avoid duplicating
-techniques that have already been tried.
+    PROMPT="${CONTEXT}
+
+Your goal: improve chest X-ray disease classification. Current best val_auc=${BEST_AUC}.
 
 Steps you MUST follow:
 1. Read /home/nvidia/autoresearch/train.py
-2. Read /home/nvidia/autoresearch/results.tsv   (contains ALL nodes' experiments)
+2. Read /home/nvidia/autoresearch/results.tsv
 3. Read /home/nvidia/autoresearch/program.md
 4. Choose ONE specific improvement not yet tried that could beat val_auc=${BEST_AUC}
 5. Write the complete new train.py using the bash tool:
