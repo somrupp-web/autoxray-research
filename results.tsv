@@ -1,0 +1,15 @@
+commit	val_auc	memory_gb	status	description
+931c264	0.725523	4.0	keep	baseline DenseNet-121 ImageNet pretrained
+194e29e	0.000000	0.0	crash	increase LR 1e-3 OOM (Ollama held 42GB)
+91e9487	0.765089	2.1	keep	mixed precision fp16 training
+0707935	0.764267	2.1	discard	pos_weight class balancing (no improvement)
+88a72c7	0.772540	2.1	keep	iter-1
+d95aa11	0.758441	2.1	discard	iter-2
+66a5a6b		0.0	discard	iter-3
+fff15db	0.775499	2.1	keep	iter-4
+268eead		0.0	discard	iter-5
+3e34eab	0.761366	2.1	discard	iter-6
+6cf18d4	0.762949	1.5	discard	iter-7
+86e9b52	0.697699	2.1	discard	iter-8
+3e900f5	0.771655	2.8	discard	iter-9
+010e816	0.583660	2.1	discard	iter-1

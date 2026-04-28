@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.uv/
+uv.lock
+*.log
+run.log
+loop_run.log
+overnight.log
+.venv/
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+analysis.ipynb
