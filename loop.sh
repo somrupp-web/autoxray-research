@@ -11,7 +11,7 @@
 
 REPO_DIR="/home/nvidia/autoresearch"
 UV="/home/nvidia/.local/bin/uv"
-OPENCODE=$(find /home/nvidia/.local/share/fnm -name opencode -type f 2>/dev/null | head -1)
+OPENCODE=$(find /home/nvidia/.local/bin /home/nvidia/.local/share/fnm -name opencode -type f 2>/dev/null | head -1)
 MODEL="vllm//home/nvidia/models/Qwen3.5-122B-A10B-AWQ"
 MAX_ITER="${1:-20}"
 NODE_ID="${NODE_ID:-0}"
