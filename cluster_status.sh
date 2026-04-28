@@ -1,18 +1,21 @@
 #!/bin/bash
-# ============================================================
 # cluster_status.sh — show live status of all 4 research loops
-# ============================================================
 
 NODES=(
-    "nvidia@10.137.203.188"   # node-0
-    "nvidia@10.137.203.189"   # node-1
-    "nvidia@10.137.203.190"   # node-2
-    "nvidia@10.137.203.191"   # node-3
+    "nvidia@10.137.203.228"   # node-0
+    "nvidia@10.137.203.184"   # node-1
+    "nvidia@10.137.203.174"   # node-2
+    "nvidia@10.137.203.177"   # node-3
 )
-
+SSH_PASS="nvidia"
 REPO_DIR="/home/nvidia/autoresearch"
 
-remote() { ssh -o ConnectTimeout=5 -o BatchMode=yes "$1" "${@:2}" 2>/dev/null; }
+remote() {
+    sshpass -p "$SSH_PASS" ssh \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=5 \
+        "$1" "${@:2}" 2>/dev/null
+}
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Autoresearch Cluster Status  —  $(date '+%Y-%m-%d %H:%M:%S')"
@@ -23,7 +26,6 @@ for i in "${!NODES[@]}"; do
     echo ""
     echo "── node-$i  ($node) ────────────────────────────────────────"
 
-    # Last 5 lines of loop log
     LASTLOG=$(remote "$node" "tail -5 $REPO_DIR/loop_node${i}.log 2>/dev/null")
     if [ -n "$LASTLOG" ]; then
         echo "$LASTLOG"
@@ -31,21 +33,18 @@ for i in "${!NODES[@]}"; do
         echo "  (no log yet)"
     fi
 
-    # Best result this node has found
     BEST=$(remote "$node" "grep 'keep' $REPO_DIR/results.tsv 2>/dev/null \
            | awk '{print \$2, \$5}' | sort -n | tail -1")
     [ -n "$BEST" ] && echo "  Local best: $BEST"
 
-    # vLLM status
     VLLM=$(remote "$node" "curl -sf http://127.0.0.1:8080/v1/models > /dev/null 2>&1 \
            && echo 'running' || echo 'DOWN'")
     echo "  vLLM: ${VLLM:-unknown}"
 done
 
-# Global best across all nodes (from GitHub)
 echo ""
 echo "── Global best (all branches) ─────────────────────────────────"
-git fetch origin 2>/dev/null | true
+git fetch origin 2>/dev/null || true
 GLOBAL_BEST=$(
     for n in 0 1 2 3; do
         git show "origin/node-${n}:results.tsv" 2>/dev/null | grep 'keep' | awk '{print $2}'
