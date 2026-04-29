@@ -16,43 +16,53 @@ Target: Beat CheXNet benchmark of 0.841.
 - `evaluate_auc(model, loader, device)` → mean AUC-ROC float
 - `TIME_BUDGET=600`, `NUM_CLASSES=14`, `DISEASES=[list of 14]`
 - `_default_train_tfm()`, `_default_val_tfm()` — standard ImageNet transforms
+- `train_loader.dataset` — the underlying PyTorch Dataset object
+- No internal classes like `_XrayDataset` are exposed — do not try to import them
 
-## Current best result
-See results.tsv for history. Beat the val_auc in the highest-scoring "keep" row.
-
-## How to write train.py
-**IMPORTANT: Use the bash tool to write the file. Do NOT use the edit tool.**
-
-Write the complete new train.py using this exact bash command:
-```
-cat > /home/nvidia/autoresearch/train.py << 'PYEOF'
-[full file content here]
-PYEOF
-```
+## Dataset facts
+- ChestMNIST: 78k train / 11k val / 22k test images, 28×28 upsampled to 224×224
+- Each label is a numpy array of shape `(14,)` or `(14,1)` — call `.squeeze()` for `(14,)`
+- To access raw labels for weight computation, use `medmnist.ChestMNIST` directly:
+  ```python
+  from medmnist import ChestMNIST
+  ds = ChestMNIST(split='train', size=28, download=True)
+  # ds[i] returns (img, lbl) where lbl is numpy array shape (14,) or (14,1)
+  ```
+- To rebuild train_loader with a custom sampler:
+  ```python
+  train_loader, val_loader, test_loader = make_loaders()
+  train_loader = torch.utils.data.DataLoader(
+      train_loader.dataset, batch_size=32, sampler=your_sampler,
+      num_workers=train_loader.num_workers, pin_memory=True, drop_last=True)
+  ```
 
 ---
 
 ## CRITICAL — These mistakes crash training (loop skips the iteration)
 
 ### 1. Loss must be a scalar before .backward()
-PyTorch's `.backward()` requires a single number. BCEWithLogitsLoss with
-`reduction='none'` returns shape `(batch, 14)` — NOT a scalar.
+`.backward()` requires a single number. BCEWithLogitsLoss with `reduction='none'`
+returns shape `(batch, 14)` — NOT a scalar. Always reduce first:
 
 ```python
-# WRONG — crashes with: RuntimeError: grad can be implicitly created only for scalar outputs
-loss = criterion(logits, labels)
-scaler.scale(loss).backward()
-
-# CORRECT — always reduce to scalar first
-loss = criterion(logits, labels).mean()
-scaler.scale(loss).backward()
+loss = criterion(logits, labels).mean()   # ✓ scalar
+loss = criterion(logits, labels)          # ✗ crashes: RuntimeError: grad can be
+                                          #   implicitly created only for scalar outputs
 ```
 
-This applies to ALL loss functions: BCEWithLogitsLoss, FocalLoss, custom losses.
-If you implement a custom Focal Loss or weighted loss, its `forward()` must return
-a scalar OR you must call `.mean()` / `.sum()` on its output.
+Applies to ALL loss functions including custom ones.
 
-### 2. Print format must match exactly
+### 2. Do not call torch.tensor() on existing tensors or numpy arrays
+Labels from the DataLoader are already tensors. Labels from medmnist are numpy arrays.
+Both crash with `ValueError: only one element tensors can be converted to Python scalars`.
+
+```python
+torch.tensor(label)          # ✗ crashes if label is already a tensor/array
+np.array(label)              # ✓ safe conversion from tensor
+label.numpy().squeeze()      # ✓ tensor → numpy
+```
+
+### 3. Print format must match exactly
 loop.sh parses val_auc with: `grep -Eo 'val_auc[=: ]+[0-9]+\.[0-9]+'`
 
 The final print block must be:
@@ -66,57 +76,7 @@ print(f'num_params_M:     {num_params:.1f}')
 print(f'num_epochs:       {epoch}')
 ```
 
-If val_auc is printed differently (e.g. `validation_auc`, `auc=`, inside a dict),
-the loop will not find it and will skip the iteration.
-
-### 3. WeightedRandomSampler — use medmnist directly, not prepare internals
-`prepare.py` does NOT expose `_XrayDataset` or any internal dataset class.
-Do NOT use `__import__('prepare').prepare._XrayDataset(...)` — it crashes.
-Do NOT call `torch.tensor(labels)` when labels are already tensors — it crashes.
-
-The correct pattern — access ChestMNIST directly to get labels:
-
-```python
-import numpy as np
-from medmnist import ChestMNIST
-from torch.utils.data import WeightedRandomSampler
-
-# Get raw labels for weight computation (fast, size=28)
-_ds = ChestMNIST(split='train', size=28, download=True)
-labels_array = np.stack([lbl.squeeze() for _, lbl in _ds])  # shape (N, 14)
-
-# Compute per-sample weights: samples with rare diseases get higher weight
-pos_freq = labels_array.mean(axis=0).clip(1e-4, 1 - 1e-4)   # (14,)
-inv_freq  = 1.0 / pos_freq                                    # higher = rarer disease
-sample_weights = (labels_array * inv_freq[None, :]).sum(axis=1)
-sample_weights = np.where(sample_weights == 0, inv_freq.mean(), sample_weights)
-
-sampler = WeightedRandomSampler(
-    weights=sample_weights.tolist(),
-    num_samples=len(sample_weights),
-    replacement=True,
-)
-# Then pass sampler= to DataLoader (do NOT also pass shuffle=True)
-train_loader, val_loader, test_loader = make_loaders()
-train_loader = torch.utils.data.DataLoader(
-    train_loader.dataset,
-    batch_size=32,
-    sampler=sampler,
-    num_workers=train_loader.num_workers,
-    pin_memory=True,
-    drop_last=True,
-)
-```
-
-Simpler alternative with same goal — use pos_weight in the loss:
-```python
-pos_weight = torch.tensor((1 - pos_freq) / pos_freq, dtype=torch.float32).to(device)
-criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-# loss is already scalar — no .mean() needed
-```
-
 ### 4. Model must be saved for test inference
-Always keep this line at the end of training:
 ```python
 _model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trained_model.pth')
 torch.save(model.state_dict(), _model_path)
@@ -124,21 +84,12 @@ torch.save(model.state_dict(), _model_path)
 
 ---
 
-## What a good train.py looks like
-- Imports from prepare.py (TIME_BUDGET, NUM_CLASSES, make_loaders, evaluate_auc)
-- Trains within TIME_BUDGET seconds using `t_train` timer (not wall clock)
-- Uses mixed precision (GradScaler + autocast) for speed
-- Evaluates with `evaluate_auc(model, val_loader, device)` — do not reimplement this
-- Saves model weights to `trained_model.pth`
-- Prints the exact output block above
-
 ## Ideas to try (pick one not already in results.tsv)
 - **Schedulers**: CosineAnnealingLR, OneCycleLR, ReduceLROnPlateau, WarmupCosine
 - **Optimizers**: AdamW with different lr/weight_decay, SGD+momentum, Lion
 - **Augmentation**: RandAugment, CutMix, MixUp, stronger ColorJitter + RandomRotation
-- **Architecture**: EfficientNet-B3, ResNet-50, DenseNet-169 (larger than DenseNet-121)
-- **Training tricks**: Gradient clipping, SWA (Stochastic Weight Averaging), EMA
+- **Architecture**: EfficientNet-B3, ResNet-50, DenseNet-169
+- **Training tricks**: Gradient clipping, SWA, EMA
 - **Regularisation**: Label smoothing, Dropout tuning, DropBlock
-- **Sampling**: WeightedRandomSampler for class imbalance
-- **Focal loss**: Replace BCE — but remember `.mean()` on the output!
-- **Batch size**: Larger batch (128, 256) with proportionally scaled LR
+- **Class imbalance**: WeightedRandomSampler, pos_weight in loss, focal loss
+- **Batch size**: Larger batch (64, 128) with proportionally scaled LR
