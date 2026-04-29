@@ -449,6 +449,46 @@ def api_select_xray(node_id):
     })
 
 
+# ── Debug: step-by-step xray diagnostics ─────────────────────────────────
+@app.route("/api/debug-xray/<node_id>")
+def api_debug_xray(node_id):
+    node = get_node(node_id)
+    if not node:
+        return jsonify({"error": "not found"}), 404
+    ip = node["ip"]
+    results = {}
+
+    # 1. Basic connectivity
+    out, err = ssh_run(ip, "echo ssh_ok", timeout=8)
+    results["ssh"] = out.strip() if out else f"FAIL: {err}"
+
+    # 2. Does .venv exist?
+    out, err = ssh_run(ip, f"test -f {REPO}/.venv/bin/python3 && echo venv_ok || echo venv_missing", timeout=8)
+    results["venv"] = out.strip() if out else f"FAIL: {err}"
+
+    # 3. Can the venv python import medmnist?
+    out, err = _ssh_exec(ip, f"{REPO}/.venv/bin/python3 -c \"import medmnist; print('medmnist_ok')\"", timeout=15)
+    results["medmnist"] = (out or "") + (" ERR:" + err if err else "")
+
+    # 4. SFTP a tiny script and run it
+    mini = "import medmnist; ds=medmnist.ChestMNIST(split='test',size=28,download=False); print(len(ds))\n"
+    remote_mini = "/tmp/_autoxray_mini.py"
+    try:
+        c = _ssh(ip, timeout=10)
+        sftp = c.open_sftp()
+        sftp.putfo(io.BytesIO(mini.encode()), remote_mini)
+        sftp.close()
+        results["sftp"] = "ok"
+        _, stdout, stderr = c.exec_command(f"{REPO}/.venv/bin/python3 {remote_mini}")
+        results["mini_run_stdout"] = stdout.read().decode(errors="replace").strip()
+        results["mini_run_stderr"] = stderr.read().decode(errors="replace").strip()
+        c.close()
+    except Exception as e:
+        results["sftp_error"] = str(e)
+
+    return jsonify(results)
+
+
 # ── Reset train.py to original baseline ───────────────────────────────────
 @app.route("/api/reset/<node_id>", methods=["POST"])
 def api_reset(node_id):
