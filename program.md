@@ -69,7 +69,25 @@ print(f'num_epochs:       {epoch}')
 If val_auc is printed differently (e.g. `validation_auc`, `auc=`, inside a dict),
 the loop will not find it and will skip the iteration.
 
-### 3. Model must be saved for test inference
+### 3. WeightedRandomSampler — labels are already tensors
+When computing class weights, medmnist labels are already numpy arrays or tensors.
+Do NOT call `torch.tensor()` on them — it crashes.
+
+```python
+# WRONG — crashes: ValueError: only one element tensors can be converted to Python scalars
+labels_tensor = torch.tensor(labels)
+
+# CORRECT — use numpy stack
+import numpy as np
+labels_array = np.stack([lbl.numpy().squeeze() for _, lbl in train_loader.dataset])
+# labels_array shape: (N, 14) — now compute class weights from this
+pos_freq = labels_array.mean(axis=0).clip(1e-6, 1 - 1e-6)  # (14,)
+weights_per_sample = (1.0 / pos_freq[None, :] * labels_array +
+                      1.0 / (1 - pos_freq)[None, :] * (1 - labels_array)).mean(axis=1)
+sampler = torch.utils.data.WeightedRandomSampler(weights_per_sample, len(weights_per_sample))
+```
+
+### 4. Model must be saved for test inference
 Always keep this line at the end of training:
 ```python
 _model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trained_model.pth')
