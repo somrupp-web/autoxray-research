@@ -59,7 +59,7 @@ def api_status(node_id):
         return jsonify({"error": "not found"}), 404
     out, err = ssh_run(node["ip"],
         "curl -sf http://127.0.0.1:8080/v1/models >/dev/null 2>&1 && echo vllm_ready || echo vllm_down;"
-        f"ls {REPO}/loop_node*.log {REPO}/loop_run.log 2>/dev/null | head -1;"
+        f"pgrep -f '{REPO}/[l]oop.sh' > /dev/null 2>&1 && echo loop_active || echo loop_idle;"
         f"cd {REPO} && git log --oneline 2>/dev/null | wc -l;"
         f"grep -c 'keep' {REPO}/results.tsv 2>/dev/null || echo 0",
         timeout=6)
@@ -70,7 +70,7 @@ def api_status(node_id):
     return jsonify({
         "online":  True,
         "vllm":    "ready" if any("vllm_ready" in l for l in lines) else "loading",
-        "loop":    "running" if any(".log" in l for l in lines) else "stopped",
+        "loop":    "running" if any("loop_active" in l for l in lines) else "stopped",
         "commits": next((l for l in lines if l.strip().isdigit() and int(l) > 0), "0"),
         "kept":    lines[-1] if lines else "0",
     })
@@ -101,10 +101,11 @@ def code_stream(node_id):
                     current_hash = out.read().decode().strip()
 
                     if current_hash and current_hash != last_hash:
-                        # Get the diff vs last commit; fall back to full file on first load
+                        # Diff vs original baseline — empty when at baseline, shows only OpenCode additions
                         _, diff_out, _ = ssh.exec_command(
                             f"cd {REPO} && "
-                            f"git diff HEAD -- train.py 2>/dev/null")
+                            f"ORIG=$(git log --oneline -- train.py | tail -1 | awk '{{print $1}}') && "
+                            f"git diff $ORIG -- train.py 2>/dev/null")
                         diff = diff_out.read().decode(errors="replace").strip()
 
                         # Also get the full file
@@ -112,17 +113,10 @@ def code_stream(node_id):
                             f"cat {REPO}/train.py 2>/dev/null")
                         full = full_out.read().decode(errors="replace")
 
-                        # Get current iteration info from the newest loop log
-                        _, log_out, _ = ssh.exec_command(
-                            f"ls -t {REPO}/loop_node*.log {REPO}/loop_run.log "
-                            f"2>/dev/null | head -1 | xargs tail -5 2>/dev/null")
-                        log_tail = log_out.read().decode(errors="replace").strip()
-
                         payload = {
-                            "hash":     current_hash,
-                            "diff":     diff,
-                            "full":     full,
-                            "log_tail": log_tail,
+                            "hash": current_hash,
+                            "diff": diff,
+                            "full": full,
                         }
                         yield f"data: {json.dumps(payload)}\n\n"
                         last_hash = current_hash
@@ -164,10 +158,11 @@ def log_stream(node_id):
             ch = ssh.get_transport().open_session()
             ch.set_combine_stderr(True)
             cmd = (
-                f"LOG=$(ls -t {REPO}/loop_node*.log {REPO}/loop_run.log "
-                f"2>/dev/null | head -1);"
-                f" if [ -n \"$LOG\" ]; then tail -n 200 -f \"$LOG\";"
-                f" else tail -n 100 -f /tmp/vllm.log 2>/dev/null; fi"
+                f"LOG={REPO}/loop_node0.log;"
+                # wait for file to appear, then follow by name (-F) so
+                # deletion+recreation on each Start Training is handled correctly
+                f" while ! [ -f \"$LOG\" ]; do sleep 1; done;"
+                f" exec tail -F -n 0 \"$LOG\""
             )
             ch.exec_command(cmd)
             buf = b""
@@ -211,6 +206,20 @@ def api_inference(node_id):
     except Exception as e:
         return jsonify({"error": str(e)})
 
+@app.route("/api/inference-history/<node_id>")
+def api_inference_history(node_id):
+    node = get_node(node_id)
+    if not node:
+        return jsonify({"error": "not found"}), 404
+    out, err = ssh_run(node["ip"], f"cat {REPO}/test_inference_history.json 2>/dev/null")
+    if not out or not out.strip():
+        return jsonify([])
+    try:
+        data = json.loads(out)
+        return jsonify(data if isinstance(data, list) else [])
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @app.route("/api/xray-image/<node_id>")
 def api_xray_image(node_id):
     import base64
@@ -225,6 +234,40 @@ def api_xray_image(node_id):
     return jsonify({"data": out.strip()})
 
 
+# ── Current train.py content ──────────────────────────────────────────────
+@app.route("/api/trainpy/<node_id>")
+def api_trainpy(node_id):
+    node = get_node(node_id)
+    if not node:
+        return jsonify({"error": "not found"}), 404
+    out, err = ssh_run(node["ip"], f"cat {REPO}/train.py 2>/dev/null")
+    return jsonify({"content": out or ""})
+
+
+# ── GPU stats ─────────────────────────────────────────────────────────────
+@app.route("/api/gpu/<node_id>")
+def api_gpu(node_id):
+    node = get_node(node_id)
+    if not node:
+        return jsonify({"error": "not found"}), 404
+    out, err = ssh_run(node["ip"],
+        "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu "
+        "--format=csv,noheader,nounits 2>/dev/null | head -1",
+        timeout=6)
+    if not out or not out.strip():
+        return jsonify({})
+    parts = [p.strip() for p in out.strip().split(',')]
+    def safe(x):
+        try: return float(x)
+        except: return None
+    return jsonify({
+        "util":      safe(parts[0]) if len(parts) > 0 else None,
+        "mem_used":  safe(parts[1]) if len(parts) > 1 else None,
+        "mem_total": safe(parts[2]) if len(parts) > 2 else None,
+        "temp":      safe(parts[3]) if len(parts) > 3 else None,
+    })
+
+
 # ── Results ────────────────────────────────────────────────────────────────
 @app.route("/api/file/<node_id>/results.tsv")
 def api_results(node_id):
@@ -233,6 +276,40 @@ def api_results(node_id):
         return jsonify({"error": "not found"}), 404
     out, err = ssh_run(node["ip"], f"cat {REPO}/results.tsv 2>/dev/null || echo ''")
     return jsonify({"content": out or "", "error": err})
+
+
+# ── Start / Stop training loop ────────────────────────────────────────────
+@app.route("/api/start/<node_id>", methods=["POST"])
+def api_start(node_id):
+    node = get_node(node_id)
+    if not node:
+        return jsonify({"error": "not found"}), 404
+    data = request.json or {}
+    max_iter = max(1, min(100, int(data.get("max_iter", 10))))
+    cmd = (
+        f"cd {REPO} && "
+        f"tmux kill-session -t autoresearch 2>/dev/null || true; "
+        # delete all stale logs and inference results so the WebUI starts clean
+        f"rm -f {REPO}/loop_node*.log {REPO}/loop_run.log "
+        f"    {REPO}/test_inference_results.json {REPO}/test_inference_history.json; "
+        # launch loop — loop.sh resets train.py to baseline at iteration start
+        f"tmux new-session -d -s autoresearch "
+        f"'bash {REPO}/loop.sh {max_iter} 2>&1 | tee {REPO}/loop_node0.log' && "
+        f"echo started"
+    )
+    out, err = ssh_run(node["ip"], cmd, timeout=20)
+    success = bool(out and "started" in out)
+    return jsonify({"success": success, "max_iter": max_iter, "error": err})
+
+@app.route("/api/stop/<node_id>", methods=["POST"])
+def api_stop(node_id):
+    node = get_node(node_id)
+    if not node:
+        return jsonify({"error": "not found"}), 404
+    out, err = ssh_run(node["ip"],
+        "tmux kill-session -t autoresearch 2>/dev/null && echo stopped || echo not_running",
+        timeout=10)
+    return jsonify({"success": bool(out and "stopped" in out), "error": err})
 
 
 # ── Reset train.py to original baseline ───────────────────────────────────
@@ -304,44 +381,60 @@ main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 .tab:hover{color:#c9d1d9}
 .tab.active{color:#f0f6fc;border-bottom-color:#1f6feb}
 .tabs-spacer{flex:1}
-.reset-btn{padding:5px 12px;background:#21262d;border:1px solid #f8514966;
-  border-radius:6px;color:#f85149;font-size:12px;cursor:pointer;transition:all .15s}
-.reset-btn:hover{background:#f8514922}
+.reset-btn{padding:5px 12px;background:#21262d;border:1px solid #30363d;
+  border-radius:6px;color:#8b949e;font-size:12px;cursor:pointer;transition:all .15s}
+.reset-btn:hover{background:#30363d}
+.start-btn{padding:5px 14px;background:#1a3a1a;border:1px solid #3fb95066;
+  border-radius:6px;color:#3fb950;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s}
+.start-btn:hover:not(:disabled){background:#3fb95022}
+.start-btn:disabled{opacity:.4;cursor:not-allowed}
+.stop-btn{padding:5px 12px;background:#3a1a1a;border:1px solid #f8514966;
+  border-radius:6px;color:#f85149;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s}
+.stop-btn:hover{background:#f8514922}
+.iter-input{width:52px;padding:3px 6px;background:#21262d;border:1px solid #30363d;
+  border-radius:6px;color:#c9d1d9;font-size:12px;text-align:center}
+.iter-input:focus{outline:none;border-color:#58a6ff}
 
 .content{flex:1;overflow:hidden;position:relative}
 .panel{display:none;height:100%;overflow:hidden}
 .panel.active{display:flex;flex-direction:column}
 
-/* ── Diff view ── */
-.diff-wrap{flex:1;overflow-y:auto;font-family:'Cascadia Code','Fira Code',monospace;
-  font-size:12.5px;line-height:1.6;background:#0d1117}
-.diff-header{padding:8px 16px;background:#161b22;border-bottom:1px solid #30363d;
-  flex-shrink:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.diff-header span{font-size:12px;color:#8b949e}
-.diff-header strong{font-size:12px;color:#c9d1d9}
-.view-toggle{display:flex;gap:0}
-.vt-btn{padding:3px 10px;background:#21262d;border:1px solid #30363d;
-  color:#8b949e;font-size:11px;cursor:pointer}
-.vt-btn:first-child{border-radius:6px 0 0 6px}
-.vt-btn:last-child{border-radius:0 6px 6px 0}
-.vt-btn.active{background:#1f6feb33;color:#58a6ff;border-color:#1f6feb}
+/* ── Code live view ── */
+.code-header{padding:8px 16px;background:#161b22;border-bottom:1px solid #30363d;
+  flex-shrink:0;display:flex;align-items:center;gap:10px}
+.code-header strong{font-size:12px;color:#c9d1d9}
+.code-header span{font-size:11px;color:#8b949e}
+.code-scroll{flex:1;overflow-y:auto;background:#0d1117;
+  font-family:'Cascadia Code','Fira Code',monospace;font-size:12.5px;line-height:1.7}
+.cl{display:flex;padding:0 8px;min-height:22px}
+.cl:hover{background:#ffffff06}
+.cl-n{width:42px;flex-shrink:0;color:#484f58;user-select:none;
+  font-size:11px;text-align:right;padding-right:14px;padding-top:2px}
+.cl-c{flex:1;white-space:pre;color:#c9d1d9;overflow:hidden;text-overflow:ellipsis}
+@keyframes slide-in{
+  from{opacity:0;transform:translateX(-10px);background:#1e4a20}
+  to  {opacity:1;transform:translateX(0);     background:#0c2410}
+}
+@keyframes fade-green{
+  0%  {background:#0c2410;border-left-color:#3fb950}
+  100%{background:transparent;border-left-color:transparent}
+}
+.cl.is-new{border-left:3px solid #3fb950;animation:slide-in .2s ease-out,fade-green 5s .2s ease forwards}
+.cl.is-new .cl-c{color:#b5f5b8}
 
-/* Diff lines */
-.diff-block{padding:12px 0}
-.diff-line{display:flex;padding:0 16px;min-height:20px}
-.diff-line:hover{background:#ffffff08}
-.dl-num{width:50px;flex-shrink:0;color:#484f58;user-select:none;font-size:11px;padding-top:1px}
-.dl-sign{width:16px;flex-shrink:0;font-weight:600}
-.dl-code{flex:1;white-space:pre-wrap;word-break:break-all}
-.diff-line.add{background:#1a2b1a}.diff-line.add .dl-sign{color:#3fb950}.diff-line.add .dl-code{color:#aff1b0}
-.diff-line.del{background:#2b1a1a}.diff-line.del .dl-sign{color:#f85149}.diff-line.del .dl-code{color:#ffa8a8;text-decoration:line-through}
-.diff-line.hunk{background:#1c2433}.diff-line.hunk .dl-code{color:#58a6ff;font-size:11px}
-.diff-line.ctx .dl-code{color:#8b949e}
-
-/* Full code view */
-.full-wrap{flex:1;overflow:auto}
-.full-wrap pre{margin:0;border-radius:0;min-height:100%}
-.full-wrap code{font-size:12.5px!important}
+/* ── Phase status bar ── */
+.phase-bar{display:flex;align-items:center;gap:10px;padding:9px 16px;
+  background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0;
+  border-left:3px solid #484f58;transition:border-color .4s}
+.phase-bar.ph-llm   {border-left-color:#d29922}
+.phase-bar.ph-train {border-left-color:#3fb950}
+.phase-bar.ph-done  {border-left-color:#58a6ff}
+.phase-bar.ph-warn  {border-left-color:#f85149}
+.ph-icon{font-size:15px;flex-shrink:0}
+.ph-desc{flex:1;font-size:12px;color:#c9d1d9}
+.ph-desc strong{font-weight:600}
+.ph-gpu{font-size:11px;font-family:'Cascadia Code',monospace;color:#58a6ff;
+  background:#1c2433;padding:2px 8px;border-radius:4px;white-space:nowrap}
 
 /* ── Log view ── */
 .terminal{flex:1;overflow-y:auto;padding:12px 16px;
@@ -414,30 +507,27 @@ tr.discard td{color:#484f58}
       <button class="tab" onclick="switchTab('results')">Results</button>
       <button class="tab" onclick="switchTab('xray')">Test X-Ray</button>
       <div class="tabs-spacer"></div>
+      <input class="iter-input" type="number" id="iter-input" value="10" min="1" max="100"
+             title="Number of training iterations">
+      <button class="start-btn" id="start-btn" onclick="startTraining()">▶ Start Training</button>
+      <button class="stop-btn"  id="stop-btn"  onclick="stopTraining()" style="display:none">■ Stop</button>
       <button class="reset-btn" onclick="resetTrainPy()"
-              title="Restore train.py to original baseline commit">⟳ Reset train.py</button>
+              title="Restore train.py to original baseline commit">⟳ Reset</button>
     </div>
 
     <div class="content">
 
       <!-- Code Changes -->
       <div class="panel active" id="panel-code">
-        <div class="diff-header">
+        <div class="code-header">
           <span class="ind" id="code-ind"></span>
-          <strong id="code-label">Select a node to watch code changes</strong>
-          <span id="code-hash" style="margin-left:auto;font-family:monospace"></span>
-          <div class="view-toggle">
-            <button class="vt-btn active" id="btn-diff" onclick="setView('diff')">Diff</button>
-            <button class="vt-btn" id="btn-full" onclick="setView('full')">Full file</button>
-          </div>
+          <strong id="code-label">train.py</strong>
+          <span id="code-hash"></span>
         </div>
-        <div class="diff-wrap" id="diff-view">
-          <div class="empty">Waiting for train.py to change…</div>
+        <div class="code-scroll" id="code-view">
+          <div class="empty">Select a node</div>
         </div>
-        <div class="full-wrap" id="full-view" style="display:none">
-          <pre><code class="language-python" id="full-code"></code></pre>
-        </div>
-        <div class="iter-ctx" id="iter-ctx" style="display:none"></div>
+        <div id="iter-ctx" style="display:none"></div>
       </div>
 
       <!-- Loop Log -->
@@ -445,6 +535,11 @@ tr.discard td{color:#484f58}
         <div class="toolbar">
           <span class="ind" id="log-ind"></span>
           <span id="log-label">Select a node</span>
+        </div>
+        <div class="phase-bar" id="phase-bar">
+          <span class="ph-icon" id="ph-icon">💤</span>
+          <span class="ph-desc" id="ph-desc">Waiting — press <strong>▶ Start Training</strong> to begin</span>
+          <span class="ph-gpu" id="ph-gpu" style="display:none"></span>
         </div>
         <div class="terminal" id="terminal"></div>
       </div>
@@ -457,7 +552,7 @@ tr.discard td{color:#484f58}
             background:#21262d;border:1px solid #30363d;border-radius:6px;
             color:#c9d1d9;font-size:12px;cursor:pointer">↻ Refresh</button>
         </div>
-        <div id="xray-content" style="flex:1;overflow:auto;padding:20px;display:flex;gap:24px;align-items:flex-start">
+        <div id="xray-content" style="flex:1;overflow:auto;padding:20px">
           <div class="empty">Select a node and wait for a training run to complete</div>
         </div>
       </div>
@@ -485,8 +580,89 @@ tr.discard td{color:#484f58}
 // ── State ─────────────────────────────────────────────────────────────────
 let nodes = [], activeNodeId = null, activeTab = 'code';
 let codeEvt = null, logEvt = null;
-let codeView = 'diff';   // 'diff' | 'full'
 let changeCount = 0;
+let gpuPollTimer = null;
+
+// ── Phase detection ───────────────────────────────────────────────────────
+const PHASE_RULES = [
+  { re: /Running OpenCode agent/i,
+    cls:'ph-llm',   icon:'🤖',
+    html:'<strong>LLM Inference</strong> — Qwen3.5-122B is reading train.py &amp; results, planning the next improvement' },
+  { re: /Training started|fp16|OneCycleLR/i,
+    cls:'ph-train', icon:'🧠',
+    html:'<strong>DenseNet-121 Training</strong> — fitting chest X-ray classifier on GPU (10 min budget)' },
+  { re: /val_auc:\s*[\d.]+/i,
+    cls:'ph-train', icon:'📊',
+    html:'<strong>Evaluating</strong> — computing validation AUC on held-out set' },
+  { re: /Running test inference/i,
+    cls:'ph-llm',   icon:'🔬',
+    html:'<strong>Test Inference</strong> — running sample X-ray #42 through trained DenseNet' },
+  { re: /NEW BEST/i,
+    cls:'ph-done',  icon:'⭐',
+    html:'<strong>New best model found!</strong> — keeping this improvement' },
+  { re: /No improvement|discard/i,
+    cls:'ph-warn',  icon:'↩️',
+    html:'<strong>No improvement</strong> — reverting train.py to baseline' },
+  { re: /syntax error|SyntaxError/i,
+    cls:'ph-warn',  icon:'⚠️',
+    html:'<strong>Syntax error</strong> in generated code — skipping this iteration' },
+  { re: /══+\s*Iteration\s*(\d+)/i,
+    cls:'ph-llm',   icon:'🔄',
+    html: (m) => `<strong>Iteration ${m[1]}</strong> — resetting train.py to Karpathy baseline, launching OpenCode` },
+  { re: /Loop complete/i,
+    cls:'ph-done',  icon:'✅',
+    html:'<strong>All iterations complete!</strong> — research loop finished' },
+  { re: /Waiting for vLLM/i,
+    cls:'',         icon:'⏳',
+    html:'<strong>Waiting for vLLM</strong> — checking Qwen3.5-122B server is ready' },
+];
+
+function updatePhaseFromLine(line) {
+  for (const rule of PHASE_RULES) {
+    const m = line.match(rule.re);
+    if (m) {
+      const html = typeof rule.html === 'function' ? rule.html(m) : rule.html;
+      setPhase(rule.cls, rule.icon, html);
+      return;
+    }
+  }
+}
+
+function setPhase(cls, icon, html) {
+  const bar  = document.getElementById('phase-bar');
+  const icEl = document.getElementById('ph-icon');
+  const txEl = document.getElementById('ph-desc');
+  if (!bar) return;
+  bar.className = 'phase-bar ' + cls;
+  icEl.textContent = icon;
+  txEl.innerHTML   = html;
+}
+
+// ── GPU polling ───────────────────────────────────────────────────────────
+function startGpuPoll(nodeId) {
+  if (gpuPollTimer) clearInterval(gpuPollTimer);
+  const el = document.getElementById('ph-gpu');
+  const poll = async () => {
+    try {
+      const d = await (await fetch(`/api/gpu/${nodeId}`)).json();
+      if (d.util == null) { el.style.display='none'; return; }
+      el.style.display = '';
+      const mem = (d.mem_used != null && d.mem_total != null && d.mem_total > 0)
+        ? `  VRAM ${(d.mem_used/1024).toFixed(1)}/${(d.mem_total/1024).toFixed(1)} GB`
+        : '';
+      const tmp = d.temp != null ? `  ${d.temp}°C` : '';
+      el.textContent = `GPU ${d.util}%${mem}${tmp}`;
+    } catch(e) { el.style.display='none'; }
+  };
+  poll();
+  gpuPollTimer = setInterval(poll, 8000);
+}
+
+function stopGpuPoll() {
+  if (gpuPollTimer) { clearInterval(gpuPollTimer); gpuPollTimer = null; }
+  const el = document.getElementById('ph-gpu');
+  if (el) el.style.display = 'none';
+}
 
 // ── Init ──────────────────────────────────────────────────────────────────
 async function init() {
@@ -515,18 +691,32 @@ async function pollStatuses() {
   await Promise.all(nodes.map(async n => {
     try {
       const s = await (await fetch(`/api/status/${n.id}`)).json();
-      const dot = document.getElementById(`dot-${n.id}`);
+      const dot  = document.getElementById(`dot-${n.id}`);
       const meta = document.getElementById(`meta-${n.id}`);
       dot.className = 'dot ' + (s.online
         ? (s.vllm==='ready' ? 'online' : 'loading') : 'offline');
+      const loopRunning = s.loop === 'running';
       meta.textContent = s.online
-        ? `vLLM:${s.vllm} · ${s.kept} kept`
+        ? `vLLM:${s.vllm} · ${loopRunning ? '⚡running' : s.kept+' kept'}`
         : 'offline';
       if (s.online) online++;
+      if (n.id === activeNodeId) setLoopRunning(loopRunning);
     } catch {}
   }));
   document.getElementById('global-status').textContent =
     `${online}/${nodes.length} nodes online`;
+}
+
+function setLoopRunning(running) {
+  const startBtn = document.getElementById('start-btn');
+  const stopBtn  = document.getElementById('stop-btn');
+  startBtn.style.display = running ? 'none' : '';
+  stopBtn.style.display  = running ? '' : 'none';
+  startBtn.disabled = running;
+  if (!running) {
+    setPhase('', '💤', 'Not running — press <strong>▶ Start Training</strong> to begin');
+    stopGpuPoll();
+  }
 }
 
 // ── Node select ───────────────────────────────────────────────────────────
@@ -535,13 +725,26 @@ function selectNode(id) {
   document.getElementById(`nb-${id}`)?.classList.add('active');
   activeNodeId = id;
   const node = nodes.find(n => n.id === id);
-  startCodeStream(id);
+  // Clear stale UI
+  document.getElementById('terminal').innerHTML = '';
+  if (codeEvt) { codeEvt.close(); codeEvt = null; }
+  document.getElementById('code-ind').className = 'ind';
+  document.getElementById('code-hash').textContent = '';
+  changeCount = 0;
+
+  loadInitialCode(id);
   startLogStream(id);
+  startGpuPoll(id);
+  setPhase('', '💤', 'Waiting — press <strong>▶ Start Training</strong> to begin');
   if (activeTab === 'results') loadResults();
+  if (activeTab === 'xray')    loadXray();
   document.getElementById('code-label').textContent =
     `Watching ${node?.name ?? id} — train.py`;
   document.getElementById('log-label').textContent =
     `Loop log — ${node?.name ?? id}`;
+  // Reset button state until next poll resolves the real status
+  setLoopRunning(false);
+  pollStatuses();
 }
 
 // ── Tab switch ────────────────────────────────────────────────────────────
@@ -556,98 +759,91 @@ function switchTab(name) {
   if (name === 'xray')    loadXray();
 }
 
-// ── View toggle (diff / full) ─────────────────────────────────────────────
-function setView(v) {
-  codeView = v;
-  document.getElementById('btn-diff').classList.toggle('active', v==='diff');
-  document.getElementById('btn-full').classList.toggle('active', v==='full');
-  document.getElementById('diff-view').style.display = v==='diff' ? '' : 'none';
-  document.getElementById('full-view').style.display = v==='full' ? '' : 'none';
+// ── Code live view helpers ────────────────────────────────────────────────
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ── Code diff stream ──────────────────────────────────────────────────────
+// Parse diff → set of NEW line numbers in the resulting file
+function getAddedLines(diffText) {
+  const added = new Set();
+  let lineNo = 0;
+  for (const raw of (diffText || '').split('\n')) {
+    if (raw.startsWith('@@')) {
+      const m = raw.match(/@@ -\d+(?:,\d+)? \+(\d+)/);
+      if (m) lineNo = parseInt(m[1]) - 1;
+    } else if (raw.startsWith('+') && !raw.startsWith('+++')) {
+      lineNo++;
+      added.add(lineNo);
+    } else if (!raw.startsWith('-')) {
+      lineNo++;
+    }
+  }
+  return added;
+}
+
+function renderCodeView(content, addedSet, scrollToFirst) {
+  const view = document.getElementById('code-view');
+  const lines = content.split('\n');
+  // Remove trailing empty line artifact
+  if (lines.length && lines[lines.length-1] === '') lines.pop();
+
+  let html = '';
+  lines.forEach((line, i) => {
+    const n = i + 1;
+    const cls = addedSet.has(n) ? 'cl is-new' : 'cl';
+    html += `<div class="${cls}"><span class="cl-n">${n}</span><span class="cl-c">${esc(line)}</span></div>`;
+  });
+  view.innerHTML = html;
+
+  if (scrollToFirst && addedSet.size > 0) {
+    const firstNew = Math.min(...addedSet);
+    const el = view.children[firstNew - 1];
+    if (el) el.scrollIntoView({block:'center', behavior:'smooth'});
+  }
+}
+
+async function loadInitialCode(nodeId) {
+  const view = document.getElementById('code-view');
+  view.innerHTML = '<div class="empty">Loading train.py…</div>';
+  try {
+    const d = await (await fetch(`/api/trainpy/${nodeId}`)).json();
+    if (d.content) {
+      renderCodeView(d.content, new Set(), false);
+      const node = nodes.find(n => n.id === nodeId);
+      document.getElementById('code-label').textContent =
+        `${node?.name ?? nodeId} — train.py (baseline)`;
+      document.getElementById('code-hash').textContent = '';
+    }
+  } catch(e) {
+    view.innerHTML = `<div class="empty">Could not load train.py</div>`;
+  }
+}
+
+// ── Code live stream ──────────────────────────────────────────────────────
 function startCodeStream(nodeId) {
   if (codeEvt) { codeEvt.close(); codeEvt = null; }
   changeCount = 0;
-
-  const ind = document.getElementById('code-ind');
-  ind.className = 'ind on';
+  document.getElementById('code-ind').className = 'ind on';
 
   codeEvt = new EventSource(`/api/code-stream/${nodeId}`);
   codeEvt.onmessage = e => {
     if (!e.data) return;
     const d = JSON.parse(e.data);
-    if (d.error) { console.warn('code-stream error:', d.error); return; }
+    if (d.error) return;
 
     changeCount++;
-    document.getElementById('code-hash').textContent =
-      `#${changeCount}  ${d.hash.slice(0,8)}`;
+    const added = getAddedLines(d.diff);
+    renderCodeView(d.full, added, true);
 
-    // Show iteration context
-    if (d.log_tail) {
-      const ctx = document.getElementById('iter-ctx');
-      ctx.style.display = '';
-      ctx.textContent = d.log_tail;
-    }
-
-    // Diff view
-    renderDiff(d.diff, d.full);
-
-    // Full file view
-    const fc = document.getElementById('full-code');
-    fc.textContent = d.full;
-    hljs.highlightElement(fc);
+    const node = nodes.find(n => n.id === nodeId);
+    document.getElementById('code-label').textContent =
+      `${node?.name ?? nodeId} — train.py  ·  change #${changeCount}  ·  ${added.size} lines added`;
+    document.getElementById('code-hash').textContent = d.hash.slice(0,8);
   };
-  codeEvt.onerror = () => { ind.className = 'ind'; };
-}
-
-function renderDiff(diffText, fullText) {
-  const wrap = document.getElementById('diff-view');
-  if (!diffText) {
-    // No diff means this is the first load (unmodified from HEAD)
-    wrap.innerHTML = `<div style="padding:16px;color:#8b949e;font-family:monospace;font-size:12px">
-      No uncommitted changes — showing current train.py (${fullText.split('\n').length} lines)</div>`;
-    return;
-  }
-
-  const lines = diffText.split('\n');
-  let html = '<div class="diff-block">';
-  let lineNo = 0;
-
-  for (const raw of lines) {
-    if (raw.startsWith('@@')) {
-      // Parse hunk header to get line number
-      const m = raw.match(/@@ -\d+(?:,\d+)? \+(\d+)/);
-      if (m) lineNo = parseInt(m[1]) - 1;
-      html += `<div class="diff-line hunk">
-        <span class="dl-num"></span><span class="dl-sign"></span>
-        <span class="dl-code">${esc(raw)}</span></div>`;
-    } else if (raw.startsWith('+') && !raw.startsWith('+++')) {
-      lineNo++;
-      html += `<div class="diff-line add">
-        <span class="dl-num">${lineNo}</span>
-        <span class="dl-sign">+</span>
-        <span class="dl-code">${esc(raw.slice(1))}</span></div>`;
-    } else if (raw.startsWith('-') && !raw.startsWith('---')) {
-      html += `<div class="diff-line del">
-        <span class="dl-num"></span>
-        <span class="dl-sign">−</span>
-        <span class="dl-code">${esc(raw.slice(1))}</span></div>`;
-    } else if (raw.startsWith(' ')) {
-      lineNo++;
-      html += `<div class="diff-line ctx">
-        <span class="dl-num">${lineNo}</span>
-        <span class="dl-sign"></span>
-        <span class="dl-code">${esc(raw.slice(1))}</span></div>`;
-    }
-  }
-  html += '</div>';
-  wrap.innerHTML = html;
-  wrap.scrollTop = 0;   // scroll to top to show first change
-}
-
-function esc(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  codeEvt.onerror = () => {
+    document.getElementById('code-ind').className = 'ind';
+  };
 }
 
 // ── Loop log stream ───────────────────────────────────────────────────────
@@ -661,6 +857,7 @@ function startLogStream(nodeId) {
     if (!e.data) return;
     const text = JSON.parse(e.data);
     if (!text) return;
+    updatePhaseFromLine(text);
     const term = document.getElementById('terminal');
     const el = document.createElement('span');
     el.className = 'log-line ' + classifyLine(text);
@@ -727,12 +924,14 @@ async function loadXray() {
   const wrap = document.getElementById('xray-content');
   wrap.innerHTML = '<div class="empty">Loading…</div>';
   try {
-    const [imgResp, inferResp] = await Promise.all([
+    const [imgResp, inferResp, histResp] = await Promise.all([
       fetch(`/api/xray-image/${activeNodeId}`),
-      fetch(`/api/inference/${activeNodeId}`)
+      fetch(`/api/inference/${activeNodeId}`),
+      fetch(`/api/inference-history/${activeNodeId}`)
     ]);
-    const imgData   = await imgResp.json();
-    const inferData = await inferResp.json();
+    const imgData    = await imgResp.json();
+    const inferData  = await inferResp.json();
+    const histData   = await histResp.json();
 
     if (imgData.error && inferData.error) {
       wrap.innerHTML = `<div class="empty">No inference results yet — run a training iteration first</div>`;
@@ -741,9 +940,9 @@ async function loadXray() {
 
     const imgSrc = imgData.data
       ? `<img src="data:image/png;base64,${imgData.data}"
-              style="width:280px;height:280px;image-rendering:pixelated;
+              style="width:320px;height:320px;image-rendering:auto;
                      border:2px solid #30363d;border-radius:8px;background:#000">`
-      : `<div style="width:280px;height:280px;background:#161b22;border:2px solid #30363d;
+      : `<div style="width:320px;height:320px;background:#161b22;border:2px solid #30363d;
                      border-radius:8px;display:flex;align-items:center;justify-content:center;
                      color:#484f58;font-size:12px">No image</div>`;
 
@@ -778,45 +977,168 @@ async function loadXray() {
     const ts = inferData.timestamp
       ? new Date(inferData.timestamp).toLocaleString() : 'unknown';
 
+    // Build history timeline
+    let historySection = '';
+    const history = Array.isArray(histData) ? histData : [];
+    if (history.length > 0) {
+      const maxAcc = Math.max(...history.map(h => h.test_accuracy_pct || 0));
+      const histRows = history.map((h, idx) => {
+        const isBest = Math.abs((h.test_accuracy_pct || 0) - maxAcc) < 0.05;
+        const valAuc = h.val_auc_from_training != null
+          ? parseFloat(h.val_auc_from_training).toFixed(4) : '—';
+        const accPct = h.test_accuracy_pct != null
+          ? h.test_accuracy_pct.toFixed(1) + '%' : '—';
+        const correct = h.test_correct != null ? h.test_correct : '—';
+        const total   = h.summary?.total ?? 14;
+        const ts2     = h.timestamp
+          ? new Date(h.timestamp).toLocaleTimeString() : '';
+        const rowStyle = isBest ? 'background:#1a2b1a' : (idx % 2 === 1 ? 'background:#161b22' : '');
+        const accColor = isBest ? '#3fb950' : '#c9d1d9';
+        const barW     = h.test_accuracy_pct != null
+          ? Math.round(h.test_accuracy_pct) : 0;
+        return `<tr style="${rowStyle}">
+          <td style="color:#8b949e;padding:5px 10px;font-size:12px">${h.iteration ?? idx+1}</td>
+          <td style="color:#79c0ff;padding:5px 10px;font-family:monospace;font-size:12px">${valAuc}</td>
+          <td style="padding:5px 10px">
+            <div style="display:flex;align-items:center;gap:6px">
+              <div style="width:90px;height:7px;background:#21262d;border-radius:4px;overflow:hidden">
+                <div style="width:${barW}%;height:100%;background:${accColor};border-radius:4px;transition:width .4s"></div>
+              </div>
+              <span style="color:${accColor};font-size:12px;font-weight:${isBest?'700':'400'}">${accPct}</span>
+              ${isBest ? '<span style="color:#3fb950;font-size:10px">★ best</span>' : ''}
+            </div>
+          </td>
+          <td style="color:#8b949e;padding:5px 10px;font-size:12px">${correct}/${total}</td>
+          <td style="color:#484f58;padding:5px 10px;font-size:11px">${ts2}</td>
+        </tr>`;
+      }).join('');
+      historySection = `
+        <div style="margin-top:24px;border-top:1px solid #30363d;padding-top:16px">
+          <div style="font-size:12px;font-weight:600;color:#8b949e;text-transform:uppercase;
+                      letter-spacing:.06em;margin-bottom:10px">Test Accuracy History</div>
+          <table style="width:100%;border-collapse:collapse">
+            <thead>
+              <tr>
+                <th style="text-align:left;padding:5px 10px;color:#8b949e;font-size:11px;
+                           text-transform:uppercase;border-bottom:1px solid #30363d">Iter</th>
+                <th style="text-align:left;padding:5px 10px;color:#8b949e;font-size:11px;
+                           text-transform:uppercase;border-bottom:1px solid #30363d">Val AUC</th>
+                <th style="text-align:left;padding:5px 10px;color:#8b949e;font-size:11px;
+                           text-transform:uppercase;border-bottom:1px solid #30363d">Test Accuracy</th>
+                <th style="text-align:left;padding:5px 10px;color:#8b949e;font-size:11px;
+                           text-transform:uppercase;border-bottom:1px solid #30363d">Score</th>
+                <th style="text-align:left;padding:5px 10px;color:#8b949e;font-size:11px;
+                           text-transform:uppercase;border-bottom:1px solid #30363d">Time</th>
+              </tr>
+            </thead>
+            <tbody>${histRows}</tbody>
+          </table>
+        </div>`;
+    }
+
     wrap.innerHTML = `
-      <div style="flex-shrink:0">
-        ${imgSrc}
-        <div style="margin-top:10px;font-size:11px;color:#8b949e;text-align:center">
-          ChestMNIST sample #${inferData.test_idx ?? 42}<br>
-          ${ts}
-        </div>
-        <div style="margin-top:12px;display:flex;gap:12px;justify-content:center">
-          <div style="text-align:center;padding:8px 16px;background:#1a2b1a;border-radius:8px;border:1px solid #3fb95044">
-            <div style="font-size:22px;font-weight:700;color:#3fb950">${correctCount}</div>
-            <div style="font-size:11px;color:#8b949e">correct</div>
+      <div style="display:flex;flex-direction:column;width:100%">
+        <div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap">
+          <div style="flex-shrink:0">
+            ${imgSrc}
+            <div style="margin-top:10px;font-size:11px;color:#8b949e;text-align:center">
+              ChestMNIST sample #${inferData.test_idx ?? 42}<br>
+              ${ts}
+            </div>
+            <div style="margin-top:12px;display:flex;gap:12px;justify-content:center">
+              <div style="text-align:center;padding:8px 16px;background:#1a2b1a;border-radius:8px;border:1px solid #3fb95044">
+                <div style="font-size:22px;font-weight:700;color:#3fb950">${correctCount}</div>
+                <div style="font-size:11px;color:#8b949e">correct</div>
+              </div>
+              <div style="text-align:center;padding:8px 16px;background:#2b1a1a;border-radius:8px;border:1px solid #f8514944">
+                <div style="font-size:22px;font-weight:700;color:#f85149">${wrongCount}</div>
+                <div style="font-size:11px;color:#8b949e">wrong</div>
+              </div>
+            </div>
           </div>
-          <div style="text-align:center;padding:8px 16px;background:#2b1a1a;border-radius:8px;border:1px solid #f8514944">
-            <div style="font-size:22px;font-weight:700;color:#f85149">${wrongCount}</div>
-            <div style="font-size:11px;color:#8b949e">wrong</div>
+          <div style="flex:1;overflow:auto;min-width:300px">
+            <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+              <thead>
+                <tr>
+                  <th style="text-align:left;padding:6px 10px;color:#8b949e;font-size:11px;
+                             text-transform:uppercase;border-bottom:1px solid #30363d">Disease</th>
+                  <th style="text-align:left;padding:6px 10px;color:#8b949e;font-size:11px;
+                             text-transform:uppercase;border-bottom:1px solid #30363d">Confidence</th>
+                  <th style="padding:6px 10px;color:#8b949e;font-size:11px;
+                             text-transform:uppercase;border-bottom:1px solid #30363d">Predicted</th>
+                  <th style="padding:6px 10px;color:#8b949e;font-size:11px;
+                             text-transform:uppercase;border-bottom:1px solid #30363d">Actual</th>
+                  <th style="padding:6px 10px;color:#8b949e;font-size:11px;
+                             text-transform:uppercase;border-bottom:1px solid #30363d">✓/✗</th>
+                </tr>
+              </thead>
+              <tbody>${tableRows}</tbody>
+            </table>
           </div>
         </div>
-      </div>
-      <div style="flex:1;overflow:auto">
-        <table style="width:100%;border-collapse:collapse;font-size:12.5px">
-          <thead>
-            <tr>
-              <th style="text-align:left;padding:6px 10px;color:#8b949e;font-size:11px;
-                         text-transform:uppercase;border-bottom:1px solid #30363d">Disease</th>
-              <th style="text-align:left;padding:6px 10px;color:#8b949e;font-size:11px;
-                         text-transform:uppercase;border-bottom:1px solid #30363d">Confidence</th>
-              <th style="padding:6px 10px;color:#8b949e;font-size:11px;
-                         text-transform:uppercase;border-bottom:1px solid #30363d">Predicted</th>
-              <th style="padding:6px 10px;color:#8b949e;font-size:11px;
-                         text-transform:uppercase;border-bottom:1px solid #30363d">Actual</th>
-              <th style="padding:6px 10px;color:#8b949e;font-size:11px;
-                         text-transform:uppercase;border-bottom:1px solid #30363d">✓/✗</th>
-            </tr>
-          </thead>
-          <tbody>${tableRows}</tbody>
-        </table>
+        ${historySection}
       </div>`;
   } catch(e) {
     wrap.innerHTML = `<div class="empty">Error: ${e}</div>`;
+  }
+}
+
+// ── Start / Stop training ─────────────────────────────────────────────────
+async function startTraining() {
+  if (!activeNodeId) { toast('Select a node first', false); return; }
+  const maxIter = parseInt(document.getElementById('iter-input').value) || 10;
+  const node = nodes.find(n => n.id === activeNodeId);
+  if (!confirm(
+    `Start ${maxIter}-iteration research loop on ${node?.name}?\n\n` +
+    `train.py will be reset to the original Karpathy baseline and\n` +
+    `previous inference results will be cleared for a fresh demo.`
+  )) return;
+
+  const btn = document.getElementById('start-btn');
+  btn.disabled = true;
+  btn.textContent = '…starting';
+
+  try {
+    const d = await (await fetch(`/api/start/${activeNodeId}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({max_iter: maxIter})
+    })).json();
+    if (d.success) {
+      toast(`✓ Training started — ${maxIter} iterations`, true);
+      setLoopRunning(true);
+      switchTab('log');
+      // Reconnect log + code streams after log file is created by loop.sh
+      setTimeout(() => {
+        startLogStream(activeNodeId);
+        startCodeStream(activeNodeId);
+      }, 2500);
+    } else {
+      toast(`✗ Failed to start: ${d.error || 'unknown'}`, false);
+      btn.disabled = false;
+      btn.textContent = '▶ Start Training';
+    }
+  } catch(e) {
+    toast(`✗ ${e}`, false);
+    btn.disabled = false;
+    btn.textContent = '▶ Start Training';
+  }
+}
+
+async function stopTraining() {
+  if (!activeNodeId) { toast('Select a node first', false); return; }
+  const node = nodes.find(n => n.id === activeNodeId);
+  if (!confirm(`Stop training on ${node?.name}?`)) return;
+  try {
+    const d = await (await fetch(`/api/stop/${activeNodeId}`, {method:'POST'})).json();
+    if (d.success) {
+      toast('■ Training stopped', true);
+      setLoopRunning(false);
+    } else {
+      toast(`✗ ${d.error || 'not running'}`, false);
+    }
+  } catch(e) {
+    toast(`✗ ${e}`, false);
   }
 }
 
@@ -838,5 +1160,5 @@ def index():
     return render_template_string(HTML)
 
 if __name__ == "__main__":
-    print("AutoXray Research Monitor → http://localhost:7860")
+    print("AutoXray Research Monitor -> http://localhost:7860")
     app.run(host="0.0.0.0", port=7860, debug=False, threaded=True)

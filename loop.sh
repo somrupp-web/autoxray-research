@@ -102,6 +102,10 @@ push_results() {
 ORIG_COMMIT=$(git log --oneline -- train.py | tail -1 | awk '{print $1}')
 log "Baseline train.py commit: $ORIG_COMMIT"
 
+# ── clear stale inference results so WebUI starts clean ────────
+rm -f "$REPO_DIR/test_inference_results.json" "$REPO_DIR/test_inference_history.json"
+log "Cleared previous inference results — fresh session."
+
 # ── main loop ─────────────────────────────────────────────────
 for iter in $(seq 1 "$MAX_ITER"); do
     log "══════ Iteration $iter / $MAX_ITER ══════"
@@ -207,7 +211,7 @@ except: print('no')
         && log "Chart updated."
 
     log "Running test inference on sample X-ray..."
-    $UV run "$REPO_DIR/test_inference.py" > /tmp/infer_out.txt 2>&1 \
+    $UV run "$REPO_DIR/test_inference.py" --val-auc "${VAL_AUC:-0}" --iter "$iter" > /tmp/infer_out.txt 2>&1 \
         && log "Test inference complete." \
         || log "WARNING: test inference failed — check /tmp/infer_out.txt"
 
