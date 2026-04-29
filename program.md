@@ -1,21 +1,15 @@
-# Autonomous X-ray Research Agent — DGX Spark Cluster
+# Autonomous X-ray Research Agent — DGX Spark
 
 ## Task
 Improve chest X-ray disease classification on ChestMNIST (14 diseases, multi-label).
 Metric: **val_auc** (mean AUC-ROC across 14 diseases). Higher is better.
 Target: Beat CheXNet benchmark of 0.841.
 
-## Cluster context
-You are one of **4 agents running in parallel** on a 4-node DGX Spark cluster.
-The `results.tsv` file contains experiments from **all nodes**.
-Before choosing your improvement, scan results.tsv for techniques already tried.
-Pick something different — parallel agents should explore diverse directions.
-
 ## Rules
 - You may ONLY modify `train.py`
 - `prepare.py` is fixed — do not touch it
 - Training budget: exactly 10 minutes (TIME_BUDGET=600s in prepare.py)
-- Model resets to ImageNet pretrained weights at the start of every run
+- Model resets to ImageNet pretrained DenseNet-121 at the start of every run
 
 ## What prepare.py provides
 - `make_loaders()` → (train_loader, val_loader, test_loader)
@@ -36,27 +30,69 @@ cat > /home/nvidia/autoresearch/train.py << 'PYEOF'
 PYEOF
 ```
 
-## What a good train.py looks like
-- Imports from prepare.py
-- Builds and trains a model within TIME_BUDGET seconds of actual training time
-- Prints exactly these lines at the end (loop.sh parses them):
-  ```
-  ---
-  val_auc:          0.XXXXXX
-  training_seconds: XXX.X
-  peak_vram_mb:     XXXX.X
-  num_steps:        XXXX
-  num_params_M:     X.X
-  num_epochs:       X
-  ```
-- Uses `t_train` timer (not wall clock) to measure only training time
+---
 
-## Ideas to try — assign by node to avoid duplication
+## CRITICAL — These mistakes crash training (loop skips the iteration)
+
+### 1. Loss must be a scalar before .backward()
+PyTorch's `.backward()` requires a single number. BCEWithLogitsLoss with
+`reduction='none'` returns shape `(batch, 14)` — NOT a scalar.
+
+```python
+# WRONG — crashes with: RuntimeError: grad can be implicitly created only for scalar outputs
+loss = criterion(logits, labels)
+scaler.scale(loss).backward()
+
+# CORRECT — always reduce to scalar first
+loss = criterion(logits, labels).mean()
+scaler.scale(loss).backward()
+```
+
+This applies to ALL loss functions: BCEWithLogitsLoss, FocalLoss, custom losses.
+If you implement a custom Focal Loss or weighted loss, its `forward()` must return
+a scalar OR you must call `.mean()` / `.sum()` on its output.
+
+### 2. Print format must match exactly
+loop.sh parses val_auc with: `grep -Eo 'val_auc[=: ]+[0-9]+\.[0-9]+'`
+
+The final print block must be:
+```python
+print('---')
+print(f'val_auc:          {val_auc:.6f}')
+print(f'training_seconds: {training_seconds:.1f}')
+print(f'peak_vram_mb:     {peak_vram:.1f}')
+print(f'num_steps:        {step}')
+print(f'num_params_M:     {num_params:.1f}')
+print(f'num_epochs:       {epoch}')
+```
+
+If val_auc is printed differently (e.g. `validation_auc`, `auc=`, inside a dict),
+the loop will not find it and will skip the iteration.
+
+### 3. Model must be saved for test inference
+Always keep this line at the end of training:
+```python
+_model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trained_model.pth')
+torch.save(model.state_dict(), _model_path)
+```
+
+---
+
+## What a good train.py looks like
+- Imports from prepare.py (TIME_BUDGET, NUM_CLASSES, make_loaders, evaluate_auc)
+- Trains within TIME_BUDGET seconds using `t_train` timer (not wall clock)
+- Uses mixed precision (GradScaler + autocast) for speed
+- Evaluates with `evaluate_auc(model, val_loader, device)` — do not reimplement this
+- Saves model weights to `trained_model.pth`
+- Prints the exact output block above
+
+## Ideas to try (pick one not already in results.tsv)
 - **Schedulers**: CosineAnnealingLR, OneCycleLR, ReduceLROnPlateau, WarmupCosine
-- **Optimizers**: AdamW, SGD+momentum, Lion
-- **Augmentation**: RandAugment, CutMix, MixUp, TrivialAugment
-- **Architecture**: EfficientNet-B3/B4, ResNet-50, ViT-Small, DenseNet-169
+- **Optimizers**: AdamW with different lr/weight_decay, SGD+momentum, Lion
+- **Augmentation**: RandAugment, CutMix, MixUp, stronger ColorJitter + RandomRotation
+- **Architecture**: EfficientNet-B3, ResNet-50, DenseNet-169 (larger than DenseNet-121)
 - **Training tricks**: Gradient clipping, SWA (Stochastic Weight Averaging), EMA
-- **Regularisation**: Mixup + label smoothing, Dropout tuning, DropBlock
-- **Sampling**: WeightedRandomSampler, focal loss instead of BCE
-- **Batch size**: larger batch (128, 256) with scaled LR
+- **Regularisation**: Label smoothing, Dropout tuning, DropBlock
+- **Sampling**: WeightedRandomSampler for class imbalance
+- **Focal loss**: Replace BCE — but remember `.mean()` on the output!
+- **Batch size**: Larger batch (128, 256) with proportionally scaled LR

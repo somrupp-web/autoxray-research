@@ -197,13 +197,32 @@ IMPORTANT: Use bash to write the file (step 5). Do NOT use the edit tool."
 
     log "Training (10-min budget)..."
     $UV run train.py 2>&1 | tee run.log
-    log "Training complete."
+    TRAIN_EXIT=${PIPESTATUS[0]}
+    log "Training complete (exit=$TRAIN_EXIT)."
+
+    # ── Crash detection: non-zero exit = Python exception ─────────────────────
+    if [ "$TRAIN_EXIT" -ne 0 ]; then
+        CRASH_MSG=$(grep -m1 "Error:\|Traceback" run.log 2>/dev/null || echo "unknown error")
+        log "WARNING: Training CRASHED — skipping iteration. Reason: $CRASH_MSG"
+        git reset HEAD~1 2>/dev/null || true
+        git checkout train.py 2>/dev/null || true
+        continue
+    fi
 
     # Flexible extraction: handles any format OpenCode might use for output
     VAL_AUC=$(grep -Eo 'val_auc[=: ]+[0-9]+\.[0-9]+' run.log | grep -Eo '[0-9]+\.[0-9]+' | head -1)
     PEAK_MB=$(grep -Eo 'peak_vram_mb[=: ]+[0-9]+' run.log | grep -Eo '[0-9]+$' | head -1)
     VRAM_GB=$(python3 -c \
         "print(f'{float(\"${PEAK_MB:-0}\")/1024:.1f}')" 2>/dev/null || echo "?")
+
+    # ── Missing val_auc: training succeeded but output format not recognised ──
+    if [ -z "$VAL_AUC" ]; then
+        log "WARNING: val_auc not found in run.log — skipping iteration."
+        log "Last 5 lines of run.log: $(tail -5 run.log | tr '\n' '|')"
+        git reset HEAD~1 2>/dev/null || true
+        git checkout train.py 2>/dev/null || true
+        continue
+    fi
 
     log "val_auc=$VAL_AUC  global_best=$BEST_AUC"
 

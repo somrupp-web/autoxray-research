@@ -94,6 +94,7 @@ def sync_scripts_to_remote(ip):
         ("loop.sh",          "loop.sh"),
         ("test_inference.py","test_inference.py"),
         ("train.py",         "train.py.baseline"),   # stored as baseline, not overwriting live file
+        ("program.md",       "program.md"),          # research guidelines OpenCode reads each iteration
     ]:
         local  = _os.path.join(_REPO_LOCAL, fname)
         remote = f"{REPO}/{remote_name}"
