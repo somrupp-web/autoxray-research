@@ -121,6 +121,27 @@ fi
 rm -f "$REPO_DIR/test_inference_results.json" "$REPO_DIR/test_inference_history.json"
 log "Cleared previous inference results — fresh session."
 
+# ── pick a test image with a mix of YES/NO disease labels ──────
+# Default index 42 is a healthy patient (all-zero labels) — useless for
+# evaluating model quality. Auto-select an image with 2-8 positive labels
+# so test accuracy is meaningful. Skipped if user already chose one via WebUI.
+if [ ! -f "$REPO_DIR/test_xray_idx.txt" ]; then
+    log "Auto-selecting test image with mixed disease labels..."
+    $UV run python3 -c "
+from medmnist import ChestMNIST
+import random
+ds = ChestMNIST(split='test', size=28, download=True)
+good = [i for i,(img,lbl) in enumerate(ds) if 2 <= int(lbl.sum()) <= 8]
+idx = random.choice(good) if good else 100
+open('$REPO_DIR/test_xray_idx.txt', 'w').write(str(idx))
+print(idx)
+" 2>/dev/null \
+    && log "Test image auto-selected: idx=$(cat $REPO_DIR/test_xray_idx.txt)" \
+    || log "WARNING: auto-select failed — will use DEFAULT_IDX from test_inference.py"
+else
+    log "Test image already set: idx=$(cat $REPO_DIR/test_xray_idx.txt)"
+fi
+
 # ── main loop ─────────────────────────────────────────────────
 for iter in $(seq 1 "$MAX_ITER"); do
     log "══════ Iteration $iter / $MAX_ITER ══════"

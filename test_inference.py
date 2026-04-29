@@ -37,7 +37,7 @@ JSON_OUT     = os.path.join(REPO, "test_inference_results.json")
 HISTORY_PATH = os.path.join(REPO, "test_inference_history.json")
 IDX_FILE     = os.path.join(REPO, "test_xray_idx.txt")
 
-DEFAULT_IDX = 42
+DEFAULT_IDX = None   # resolved at runtime — picks a mixed-label image, not hardcoded
 THRESHOLD   = 0.5
 device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -54,14 +54,23 @@ def parse_args():
 
 
 def resolve_idx(args_idx):
-    """CLI arg > test_xray_idx.txt > DEFAULT_IDX (42)."""
+    """CLI arg > test_xray_idx.txt > auto-pick mixed-label image > fallback 100."""
     if args_idx is not None:
         return args_idx
     try:
         with open(IDX_FILE) as f:
             return int(f.read().strip())
     except Exception:
-        return DEFAULT_IDX
+        pass
+    # No idx file — pick a sample with 2-8 positive labels so accuracy is meaningful
+    try:
+        from medmnist import ChestMNIST
+        import random
+        ds = ChestMNIST(split="test", size=28, download=True)
+        good = [i for i, (img, lbl) in enumerate(ds) if 2 <= int(lbl.sum()) <= 8]
+        return random.choice(good) if good else 100
+    except Exception:
+        return 100
 
 
 def load_model():
