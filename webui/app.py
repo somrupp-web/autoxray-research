@@ -138,11 +138,16 @@ def code_stream(node_id):
                     current_hash = out.read().decode().strip()
 
                     if current_hash and current_hash != last_hash:
-                        # Diff vs original baseline — empty when at baseline, shows only OpenCode additions
+                        # Diff vs train.py.baseline (SFTP-uploaded DenseNet version).
+                        # Empty when train.py == baseline; shows OpenCode additions otherwise.
+                        # Falls back to git diff if no baseline file exists.
                         _, diff_out, _ = ssh.exec_command(
-                            f"cd {REPO} && "
-                            f"ORIG=$(git log --oneline -- train.py | tail -1 | awk '{{print $1}}') && "
-                            f"git diff $ORIG -- train.py 2>/dev/null")
+                            f"if [ -f {REPO}/train.py.baseline ]; then "
+                            f"  diff -u {REPO}/train.py.baseline {REPO}/train.py 2>/dev/null || true; "
+                            f"else "
+                            f"  cd {REPO} && ORIG=$(git log --oneline -- train.py | tail -1 | awk '{{print $1}}') && "
+                            f"  git diff $ORIG -- train.py 2>/dev/null; "
+                            f"fi")
                         diff = diff_out.read().decode(errors="replace").strip()
 
                         # Also get the full file
@@ -340,8 +345,9 @@ def api_start(node_id):
         # Launch loop
         f"tmux new-session -d -s autoresearch "
         f"'bash {REPO}/loop.sh {max_iter} 2>&1 | tee {REPO}/loop_node0.log' && "
-        # Write PID file after a short delay so the bash process is visible to pgrep
-        f"sleep 1 && pgrep -f '{REPO}/loop.sh' | head -1 > {REPO}/loop.pid 2>/dev/null && "
+        # Write the tmux pane's shell PID — completely isolated from this SSH session,
+        # so it won't die when the SSH connection closes (unlike pgrep-based approach)
+        f"sleep 1 && tmux list-panes -t autoresearch -F '#{{pane_pid}}' 2>/dev/null | head -1 > {REPO}/loop.pid && "
         f"echo started"
     )
     out, err = ssh_run(node["ip"], cmd, timeout=25)
