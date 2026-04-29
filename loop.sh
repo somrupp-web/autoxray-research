@@ -98,9 +98,24 @@ push_results() {
     }
 }
 
-# ── original baseline commit for train.py ─────────────────────
-ORIG_COMMIT=$(git log --oneline -- train.py | tail -1 | awk '{print $1}')
-log "Baseline train.py commit: $ORIG_COMMIT"
+# ── baseline train.py: prefer explicit file over git history ───
+# train.py.baseline is uploaded by the WebUI at Start Training, so it's
+# always the correct DenseNet chest X-ray version regardless of git origin.
+if [ -f "$REPO_DIR/train.py.baseline" ]; then
+    log "Baseline train.py: train.py.baseline (uploaded by WebUI)"
+    ORIG_COMMIT=""
+else
+    # Fallback: find oldest commit that actually contains DenseNet code
+    ORIG_COMMIT=$(git log --format='%H' --reverse -- train.py | while read h; do
+        git show "$h":train.py 2>/dev/null | grep -q 'densenet121' && echo "$h" && break
+    done)
+    if [ -n "$ORIG_COMMIT" ]; then
+        log "Baseline train.py commit: $ORIG_COMMIT (densenet121 found)"
+    else
+        log "ERROR: no DenseNet baseline found in git history and train.py.baseline missing"
+        exit 1
+    fi
+fi
 
 # ── clear stale inference results so WebUI starts clean ────────
 rm -f "$REPO_DIR/test_inference_results.json" "$REPO_DIR/test_inference_history.json"
@@ -110,8 +125,12 @@ log "Cleared previous inference results — fresh session."
 for iter in $(seq 1 "$MAX_ITER"); do
     log "══════ Iteration $iter / $MAX_ITER ══════"
 
-    # Always start each iteration from the original unmodified train.py
-    git show "$ORIG_COMMIT":train.py > train.py
+    # Always start each iteration from the correct DenseNet baseline
+    if [ -f "$REPO_DIR/train.py.baseline" ]; then
+        cp "$REPO_DIR/train.py.baseline" train.py
+    else
+        git show "$ORIG_COMMIT":train.py > train.py
+    fi
     log "Reset train.py to original baseline."
 
     sync_global_results

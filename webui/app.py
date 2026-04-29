@@ -47,6 +47,41 @@ def get_node(node_id):
     return next((n for n in NODES if n["id"] == node_id), None)
 
 
+# ── SFTP file upload ───────────────────────────────────────────────────────
+import os as _os
+
+_REPO_LOCAL = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+
+def sftp_put(ip, local_path, remote_path, timeout=20):
+    """Upload a single file to the remote machine via SFTP."""
+    try:
+        c = _ssh(ip, timeout=timeout)
+        sftp = c.open_sftp()
+        sftp.put(local_path, remote_path)
+        sftp.close()
+        c.close()
+        return True
+    except Exception as e:
+        app.logger.warning(f"sftp_put {local_path} -> {remote_path}: {e}")
+        return False
+
+
+def sync_scripts_to_remote(ip):
+    """Push loop.sh, test_inference.py and train.py (as baseline) to the remote.
+    This bypasses git-remote issues — the remote may point at karpathy/autoresearch,
+    not our fork, so git pull would pull the wrong (GPT demo) scripts."""
+    results = {}
+    for fname, remote_name in [
+        ("loop.sh",          "loop.sh"),
+        ("test_inference.py","test_inference.py"),
+        ("train.py",         "train.py.baseline"),   # stored as baseline, not overwriting live file
+    ]:
+        local  = _os.path.join(_REPO_LOCAL, fname)
+        remote = f"{REPO}/{remote_name}"
+        results[fname] = sftp_put(ip, local, remote)
+    return results
+
+
 # ── Status ─────────────────────────────────────────────────────────────────
 @app.route("/api/nodes")
 def api_nodes():
@@ -288,10 +323,15 @@ def api_start(node_id):
         return jsonify({"error": "not found"}), 404
     data = request.json or {}
     max_iter = max(1, min(100, int(data.get("max_iter", 10))))
+    # Step 1: push correct scripts directly via SFTP (bypasses git-remote issues —
+    # the remote may point at karpathy/autoresearch, not our fork)
+    sync_results = sync_scripts_to_remote(node["ip"])
+    app.logger.info(f"SFTP sync to {node['ip']}: {sync_results}")
+
+    # Step 2: kill old session, clear stale files, launch fresh loop
     cmd = (
         f"cd {REPO} && "
-        # Pull latest loop.sh / test_inference.py from GitHub first
-        f"git pull --ff-only origin master 2>/dev/null || true; "
+        f"chmod +x {REPO}/loop.sh; "
         f"tmux kill-session -t autoresearch 2>/dev/null || true; "
         # Clear stale logs, inference results, results.tsv, and old PID file
         f"rm -f {REPO}/loop_node*.log {REPO}/loop_run.log "
@@ -304,9 +344,10 @@ def api_start(node_id):
         f"sleep 1 && pgrep -f '{REPO}/loop.sh' | head -1 > {REPO}/loop.pid 2>/dev/null && "
         f"echo started"
     )
-    out, err = ssh_run(node["ip"], cmd, timeout=20)
+    out, err = ssh_run(node["ip"], cmd, timeout=25)
     success = bool(out and "started" in out)
-    return jsonify({"success": success, "max_iter": max_iter, "error": err})
+    return jsonify({"success": success, "max_iter": max_iter,
+                    "synced": sync_results, "error": err})
 
 @app.route("/api/stop/<node_id>", methods=["POST"])
 def api_stop(node_id):
