@@ -28,6 +28,7 @@ NODES = [
 SSH_USER = "nvidia"
 SSH_PASS = "nvidia"
 REPO     = "/home/nvidia/autoresearch"
+_UV_BIN  = "/home/nvidia/.local/bin/uv"
 
 
 # ── SSH helpers ────────────────────────────────────────────────────────────
@@ -45,6 +46,18 @@ def ssh_run(ip, cmd, timeout=10):
         result = out.read().decode(errors="replace")
         c.close()
         return result, None
+    except Exception as e:
+        return None, str(e)
+
+def _ssh_exec(ip, cmd, timeout=30):
+    """Like ssh_run but captures stderr too (useful for debugging Python errors)."""
+    try:
+        c = _ssh(ip, timeout)
+        _, stdout, stderr = c.exec_command(cmd)
+        out = stdout.read().decode(errors="replace").strip()
+        err = stderr.read().decode(errors="replace").strip()
+        c.close()
+        return out or None, err or None
     except Exception as e:
         return None, str(e)
 
@@ -384,7 +397,7 @@ def api_select_xray(node_id):
 
     # Find a random image that has 2–8 positive labels so there's a mix of YES/NO
     find_cmd = (
-        "python3 -c \""
+        f"{_UV_BIN} run python3 -c \""
         "from medmnist import ChestMNIST; import random, sys; "
         "sys.stderr = open('/dev/null','w'); "
         "ds = ChestMNIST(split='test', size=28, download=True); "
@@ -392,7 +405,7 @@ def api_select_xray(node_id):
         "print(random.choice(good) if good else random.randint(0, len(ds)-1))"
         "\""
     )
-    out, err = ssh_run(node["ip"], find_cmd, timeout=30)
+    out, err = _ssh_exec(node["ip"], find_cmd, timeout=45)
     if not out or not out.strip().isdigit():
         return jsonify({"error": f"Could not pick sample: {err or out}"})
     idx = int(out.strip())
@@ -401,7 +414,7 @@ def api_select_xray(node_id):
     setup_cmd = (
         f"echo {idx} > {REPO}/test_xray_idx.txt && "
         f"rm -f {REPO}/test_inference_history.json {REPO}/test_inference_results.json && "
-        f"python3 -c \""
+        f"{_UV_BIN} run python3 -c \""
         f"from medmnist import ChestMNIST; import sys; sys.stderr=open('/dev/null','w'); "
         f"ds=ChestMNIST(split='test',size=224,download=True); "
         f"img,lbl=ds[{idx}]; img.convert('L').save('{REPO}/test_xray.png'); "
@@ -409,7 +422,7 @@ def api_select_xray(node_id):
         f"print(json.dumps({{\\\"positives\\\": int(lbl.sum()), \\\"total\\\": len(lbl)}}))"
         f"\" && echo ok"
     )
-    out2, err2 = ssh_run(node["ip"], setup_cmd, timeout=30)
+    out2, err2 = _ssh_exec(node["ip"], setup_cmd, timeout=45)
     success = bool(out2 and "ok" in out2)
 
     # Extract label info from python output (line before "ok")
