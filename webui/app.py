@@ -6,9 +6,14 @@ Open: http://localhost:7860
 """
 
 import json
+import re
 import time
 from flask import Flask, Response, jsonify, render_template_string, request
 import paramiko
+
+# Strips ANSI/VT100 escape sequences (colors, cursor moves) from terminal output
+_ANSI_RE = re.compile(r'\x1b(?:\[[0-9;]*[A-Za-z]|[()][0-9A-Za-z]|[^[])|'
+                      r'\r|\x0f|\x0e')
 
 app = Flask(__name__)
 
@@ -213,7 +218,7 @@ def log_stream(node_id):
                     buf += ch.recv(8192)
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
-                        text = line.decode(errors="replace").rstrip()
+                        text = _ANSI_RE.sub('', line.decode(errors="replace")).rstrip()
                         if text:
                             yield f"data: {json.dumps(text)}\n\n"
                 elif ch.exit_status_ready():
@@ -338,10 +343,12 @@ def api_start(node_id):
         f"cd {REPO} && "
         f"chmod +x {REPO}/loop.sh; "
         f"tmux kill-session -t autoresearch 2>/dev/null || true; "
-        # Clear stale logs, inference results, results.tsv, and old PID file
+        # Clear stale logs, inference files, and PID; recreate results.tsv with
+        # header-only so OpenCode can read it without a "file not found" error
         f"rm -f {REPO}/loop_node*.log {REPO}/loop_run.log "
         f"    {REPO}/test_inference_results.json {REPO}/test_inference_history.json "
-        f"    {REPO}/results.tsv {REPO}/loop.pid; "
+        f"    {REPO}/loop.pid; "
+        f"printf 'commit\\tval_auc\\tmemory_gb\\tstatus\\tdescription\\n' > {REPO}/results.tsv; "
         # Launch loop
         f"tmux new-session -d -s autoresearch "
         f"'bash {REPO}/loop.sh {max_iter} 2>&1 | tee {REPO}/loop_node0.log' && "
