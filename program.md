@@ -69,22 +69,50 @@ print(f'num_epochs:       {epoch}')
 If val_auc is printed differently (e.g. `validation_auc`, `auc=`, inside a dict),
 the loop will not find it and will skip the iteration.
 
-### 3. WeightedRandomSampler — labels are already tensors
-When computing class weights, medmnist labels are already numpy arrays or tensors.
-Do NOT call `torch.tensor()` on them — it crashes.
+### 3. WeightedRandomSampler — use medmnist directly, not prepare internals
+`prepare.py` does NOT expose `_XrayDataset` or any internal dataset class.
+Do NOT use `__import__('prepare').prepare._XrayDataset(...)` — it crashes.
+Do NOT call `torch.tensor(labels)` when labels are already tensors — it crashes.
+
+The correct pattern — access ChestMNIST directly to get labels:
 
 ```python
-# WRONG — crashes: ValueError: only one element tensors can be converted to Python scalars
-labels_tensor = torch.tensor(labels)
-
-# CORRECT — use numpy stack
 import numpy as np
-labels_array = np.stack([lbl.numpy().squeeze() for _, lbl in train_loader.dataset])
-# labels_array shape: (N, 14) — now compute class weights from this
-pos_freq = labels_array.mean(axis=0).clip(1e-6, 1 - 1e-6)  # (14,)
-weights_per_sample = (1.0 / pos_freq[None, :] * labels_array +
-                      1.0 / (1 - pos_freq)[None, :] * (1 - labels_array)).mean(axis=1)
-sampler = torch.utils.data.WeightedRandomSampler(weights_per_sample, len(weights_per_sample))
+from medmnist import ChestMNIST
+from torch.utils.data import WeightedRandomSampler
+
+# Get raw labels for weight computation (fast, size=28)
+_ds = ChestMNIST(split='train', size=28, download=True)
+labels_array = np.stack([lbl.squeeze() for _, lbl in _ds])  # shape (N, 14)
+
+# Compute per-sample weights: samples with rare diseases get higher weight
+pos_freq = labels_array.mean(axis=0).clip(1e-4, 1 - 1e-4)   # (14,)
+inv_freq  = 1.0 / pos_freq                                    # higher = rarer disease
+sample_weights = (labels_array * inv_freq[None, :]).sum(axis=1)
+sample_weights = np.where(sample_weights == 0, inv_freq.mean(), sample_weights)
+
+sampler = WeightedRandomSampler(
+    weights=sample_weights.tolist(),
+    num_samples=len(sample_weights),
+    replacement=True,
+)
+# Then pass sampler= to DataLoader (do NOT also pass shuffle=True)
+train_loader, val_loader, test_loader = make_loaders()
+train_loader = torch.utils.data.DataLoader(
+    train_loader.dataset,
+    batch_size=32,
+    sampler=sampler,
+    num_workers=train_loader.num_workers,
+    pin_memory=True,
+    drop_last=True,
+)
+```
+
+Simpler alternative with same goal — use pos_weight in the loss:
+```python
+pos_weight = torch.tensor((1 - pos_freq) / pos_freq, dtype=torch.float32).to(device)
+criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+# loss is already scalar — no .mean() needed
 ```
 
 ### 4. Model must be saved for test inference
