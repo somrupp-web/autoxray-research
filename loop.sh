@@ -180,8 +180,9 @@ IMPORTANT: Use bash to write the file (step 5). Do NOT use the edit tool."
     $UV run train.py 2>&1 | tee run.log
     log "Training complete."
 
-    VAL_AUC=$(grep "^val_auc:"      run.log | awk '{print $2}')
-    PEAK_MB=$(grep "^peak_vram_mb:" run.log | awk '{print $2}')
+    # Flexible extraction: handles any format OpenCode might use for output
+    VAL_AUC=$(grep -Eo 'val_auc[=: ]+[0-9]+\.[0-9]+' run.log | grep -Eo '[0-9]+\.[0-9]+' | head -1)
+    PEAK_MB=$(grep -Eo 'peak_vram_mb[=: ]+[0-9]+' run.log | grep -Eo '[0-9]+$' | head -1)
     VRAM_GB=$(python3 -c \
         "print(f'{float(\"${PEAK_MB:-0}\")/1024:.1f}')" 2>/dev/null || echo "?")
 

@@ -57,12 +57,14 @@ def api_status(node_id):
     node = get_node(node_id)
     if not node:
         return jsonify({"error": "not found"}), 404
+    # PID-file approach: written at Start, removed at Stop — survives SSH timeouts
     out, err = ssh_run(node["ip"],
         "curl -sf http://127.0.0.1:8080/v1/models >/dev/null 2>&1 && echo vllm_ready || echo vllm_down;"
-        f"pgrep -f '{REPO}/[l]oop.sh' > /dev/null 2>&1 && echo loop_active || echo loop_idle;"
+        f"PID=$(cat {REPO}/loop.pid 2>/dev/null);"
+        f" if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null; then echo loop_active; else echo loop_idle; fi;"
         f"cd {REPO} && git log --oneline 2>/dev/null | wc -l;"
         f"grep -c 'keep' {REPO}/results.tsv 2>/dev/null || echo 0",
-        timeout=6)
+        timeout=12)
     if err:
         return jsonify({"online": False, "vllm": "offline", "loop": "stopped",
                         "commits": 0, "kept": 0})
@@ -288,13 +290,18 @@ def api_start(node_id):
     max_iter = max(1, min(100, int(data.get("max_iter", 10))))
     cmd = (
         f"cd {REPO} && "
+        # Pull latest loop.sh / test_inference.py from GitHub first
+        f"git pull --ff-only origin master 2>/dev/null || true; "
         f"tmux kill-session -t autoresearch 2>/dev/null || true; "
-        # delete all stale logs and inference results so the WebUI starts clean
+        # Clear stale logs, inference results, results.tsv, and old PID file
         f"rm -f {REPO}/loop_node*.log {REPO}/loop_run.log "
-        f"    {REPO}/test_inference_results.json {REPO}/test_inference_history.json; "
-        # launch loop — loop.sh resets train.py to baseline at iteration start
+        f"    {REPO}/test_inference_results.json {REPO}/test_inference_history.json "
+        f"    {REPO}/results.tsv {REPO}/loop.pid; "
+        # Launch loop
         f"tmux new-session -d -s autoresearch "
         f"'bash {REPO}/loop.sh {max_iter} 2>&1 | tee {REPO}/loop_node0.log' && "
+        # Write PID file after a short delay so the bash process is visible to pgrep
+        f"sleep 1 && pgrep -f '{REPO}/loop.sh' | head -1 > {REPO}/loop.pid 2>/dev/null && "
         f"echo started"
     )
     out, err = ssh_run(node["ip"], cmd, timeout=20)
@@ -307,7 +314,9 @@ def api_stop(node_id):
     if not node:
         return jsonify({"error": "not found"}), 404
     out, err = ssh_run(node["ip"],
-        "tmux kill-session -t autoresearch 2>/dev/null && echo stopped || echo not_running",
+        f"tmux kill-session -t autoresearch 2>/dev/null; "
+        f"rm -f {REPO}/loop.pid; "
+        f"echo stopped",
         timeout=10)
     return jsonify({"success": bool(out and "stopped" in out), "error": err})
 
@@ -700,7 +709,8 @@ async function pollStatuses() {
         ? `vLLM:${s.vllm} · ${loopRunning ? '⚡running' : s.kept+' kept'}`
         : 'offline';
       if (s.online) online++;
-      if (n.id === activeNodeId) setLoopRunning(loopRunning);
+      // Only update button state when node is reachable — preserve state on SSH timeout
+      if (n.id === activeNodeId && s.online) setLoopRunning(loopRunning);
     } catch {}
   }));
   document.getElementById('global-status').textContent =
@@ -711,8 +721,9 @@ function setLoopRunning(running) {
   const startBtn = document.getElementById('start-btn');
   const stopBtn  = document.getElementById('stop-btn');
   startBtn.style.display = running ? 'none' : '';
+  startBtn.disabled = false;
+  startBtn.textContent = '▶ Start Training';
   stopBtn.style.display  = running ? '' : 'none';
-  startBtn.disabled = running;
   if (!running) {
     setPhase('', '💤', 'Not running — press <strong>▶ Start Training</strong> to begin');
     stopGpuPoll();
@@ -735,15 +746,18 @@ function selectNode(id) {
   loadInitialCode(id);
   startLogStream(id);
   startGpuPoll(id);
-  setPhase('', '💤', 'Waiting — press <strong>▶ Start Training</strong> to begin');
+  setPhase('', '⟳', 'Checking status…');
   if (activeTab === 'results') loadResults();
   if (activeTab === 'xray')    loadXray();
   document.getElementById('code-label').textContent =
     `Watching ${node?.name ?? id} — train.py`;
   document.getElementById('log-label').textContent =
     `Loop log — ${node?.name ?? id}`;
-  // Reset button state until next poll resolves the real status
-  setLoopRunning(false);
+  // Show indeterminate state — pollStatuses() will resolve the real status
+  const sb = document.getElementById('start-btn');
+  const xb = document.getElementById('stop-btn');
+  sb.style.display = ''; sb.disabled = true; sb.textContent = '⟳ checking…';
+  xb.style.display = 'none';
   pollStatuses();
 }
 
@@ -837,8 +851,12 @@ function startCodeStream(nodeId) {
     renderCodeView(d.full, added, true);
 
     const node = nodes.find(n => n.id === nodeId);
-    document.getElementById('code-label').textContent =
-      `${node?.name ?? nodeId} — train.py  ·  change #${changeCount}  ·  ${added.size} lines added`;
+    const lbl = document.getElementById('code-label');
+    if (added.size === 0) {
+      lbl.textContent = `${node?.name ?? nodeId} — train.py (baseline · waiting for OpenCode to write…)`;
+    } else {
+      lbl.textContent = `${node?.name ?? nodeId} — train.py  ·  change #${changeCount}  ·  ${added.size} lines added`;
+    }
     document.getElementById('code-hash').textContent = d.hash.slice(0,8);
   };
   codeEvt.onerror = () => {
@@ -1108,10 +1126,14 @@ async function startTraining() {
       toast(`✓ Training started — ${maxIter} iterations`, true);
       setLoopRunning(true);
       switchTab('log');
-      // Reconnect log + code streams after log file is created by loop.sh
+      // Reconnect streams after log file is created by loop.sh
+      // Capture nodeId in closure so a node switch can't race this timer
+      const nid = activeNodeId;
       setTimeout(() => {
-        startLogStream(activeNodeId);
-        startCodeStream(activeNodeId);
+        if (activeNodeId === nid) {
+          startLogStream(nid);
+          startCodeStream(nid);
+        }
       }, 2500);
     } else {
       toast(`✗ Failed to start: ${d.error || 'unknown'}`, false);
