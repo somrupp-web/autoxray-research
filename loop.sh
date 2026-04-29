@@ -231,7 +231,13 @@ except: print('no')
         && log "Chart updated."
 
     log "Running test inference on sample X-ray..."
-    $UV run "$REPO_DIR/test_inference.py" --val-auc "${VAL_AUC:-0}" --iter "$iter" > /tmp/infer_out.txt 2>&1 \
+    # Honour the sample index chosen via the WebUI "New Sample" button
+    _IDX_ARG=""
+    if [ -f "$REPO_DIR/test_xray_idx.txt" ]; then
+        _IDX=$(cat "$REPO_DIR/test_xray_idx.txt" | tr -dc '0-9')
+        [ -n "$_IDX" ] && _IDX_ARG="--idx $_IDX"
+    fi
+    $UV run "$REPO_DIR/test_inference.py" --val-auc "${VAL_AUC:-0}" --iter "$iter" $_IDX_ARG > /tmp/infer_out.txt 2>&1 \
         && log "Test inference complete." \
         || log "WARNING: test inference failed — check /tmp/infer_out.txt"
 

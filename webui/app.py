@@ -375,6 +375,61 @@ def api_stop(node_id):
     return jsonify({"success": bool(out and "stopped" in out), "error": err})
 
 
+# ── Select new X-ray test sample ─────────────────────────────────────────
+@app.route("/api/select-xray/<node_id>", methods=["POST"])
+def api_select_xray(node_id):
+    node = get_node(node_id)
+    if not node:
+        return jsonify({"error": "not found"}), 404
+
+    # Find a random image that has 2–8 positive labels so there's a mix of YES/NO
+    find_cmd = (
+        "python3 -c \""
+        "from medmnist import ChestMNIST; import random, sys; "
+        "sys.stderr = open('/dev/null','w'); "
+        "ds = ChestMNIST(split='test', size=28, download=True); "
+        "good = [i for i,(img,lbl) in enumerate(ds) if 2 <= int(lbl.sum()) <= 8]; "
+        "print(random.choice(good) if good else random.randint(0, len(ds)-1))"
+        "\""
+    )
+    out, err = ssh_run(node["ip"], find_cmd, timeout=30)
+    if not out or not out.strip().isdigit():
+        return jsonify({"error": f"Could not pick sample: {err or out}"})
+    idx = int(out.strip())
+
+    # Save index, clear old history/results, generate the PNG for display
+    setup_cmd = (
+        f"echo {idx} > {REPO}/test_xray_idx.txt && "
+        f"rm -f {REPO}/test_inference_history.json {REPO}/test_inference_results.json && "
+        f"python3 -c \""
+        f"from medmnist import ChestMNIST; import sys; sys.stderr=open('/dev/null','w'); "
+        f"ds=ChestMNIST(split='test',size=224,download=True); "
+        f"img,lbl=ds[{idx}]; img.convert('L').save('{REPO}/test_xray.png'); "
+        f"import json; "
+        f"print(json.dumps({{\\\"positives\\\": int(lbl.sum()), \\\"total\\\": len(lbl)}}))"
+        f"\" && echo ok"
+    )
+    out2, err2 = ssh_run(node["ip"], setup_cmd, timeout=30)
+    success = bool(out2 and "ok" in out2)
+
+    # Extract label info from python output (line before "ok")
+    label_info = {}
+    for line in (out2 or "").splitlines():
+        if line.startswith("{"):
+            try:
+                label_info = json.loads(line)
+            except Exception:
+                pass
+
+    return jsonify({
+        "success": success,
+        "idx":      idx,
+        "positives": label_info.get("positives", "?"),
+        "total":     label_info.get("total", 14),
+        "error":     err2 if not success else None,
+    })
+
+
 # ── Reset train.py to original baseline ───────────────────────────────────
 @app.route("/api/reset/<node_id>", methods=["POST"])
 def api_reset(node_id):
@@ -611,9 +666,20 @@ tr.discard td{color:#484f58}
       <div class="panel" id="panel-xray">
         <div class="toolbar">
           <span id="xray-label">Test X-Ray — sample #42</span>
-          <button onclick="loadXray()" style="margin-left:auto;padding:3px 10px;
-            background:#21262d;border:1px solid #30363d;border-radius:6px;
-            color:#c9d1d9;font-size:12px;cursor:pointer">↻ Refresh</button>
+          <div style="margin-left:auto;display:flex;gap:6px">
+            <button id="new-sample-btn" onclick="selectNewXraySample()"
+              style="padding:3px 12px;background:#1a2b1a;border:1px solid #3fb95066;
+                border-radius:6px;color:#3fb950;font-size:12px;cursor:pointer;
+                font-weight:600;transition:all .15s"
+              title="Pick a new random image that has a mix of YES/NO disease labels">
+              ⚄ New Sample
+            </button>
+            <button onclick="loadXray()"
+              style="padding:3px 10px;background:#21262d;border:1px solid #30363d;
+                border-radius:6px;color:#c9d1d9;font-size:12px;cursor:pointer">
+              ↻ Reload
+            </button>
+          </div>
         </div>
         <div id="xray-content" style="flex:1;overflow:auto;padding:20px">
           <div class="empty">Select a node and wait for a training run to complete</div>
@@ -990,6 +1056,34 @@ async function resetTrainPy() {
   }
 }
 
+// ── New X-Ray sample selection ────────────────────────────────────────────
+async function selectNewXraySample() {
+  if (!activeNodeId) { toast('Select a node first', false); return; }
+  const btn  = document.getElementById('new-sample-btn');
+  const wrap = document.getElementById('xray-content');
+  btn.disabled = true;
+  btn.textContent = '⟳ picking…';
+  wrap.innerHTML = '<div class="empty">Picking a new sample with mixed disease labels…</div>';
+  try {
+    const d = await (await fetch(`/api/select-xray/${activeNodeId}`, {method:'POST'})).json();
+    if (d.success) {
+      toast(`✓ Sample #${d.idx} — ${d.positives}/${d.total} positive labels · history cleared`, true);
+      document.getElementById('xray-label').textContent =
+        `Test X-Ray — sample #${d.idx}  (${d.positives} of ${d.total} diseases present)`;
+      await loadXray();
+    } else {
+      toast(`✗ ${d.error || 'Failed'}`, false);
+      wrap.innerHTML = `<div class="empty">Error: ${d.error}</div>`;
+    }
+  } catch(e) {
+    toast(`✗ ${e}`, false);
+    wrap.innerHTML = `<div class="empty">Error: ${e}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⚄ New Sample';
+  }
+}
+
 // ── Test X-Ray ────────────────────────────────────────────────────────────
 async function loadXray() {
   if (!activeNodeId) return;
@@ -1008,6 +1102,12 @@ async function loadXray() {
     if (imgData.error && inferData.error) {
       wrap.innerHTML = `<div class="empty">No inference results yet — run a training iteration first</div>`;
       return;
+    }
+
+    // Keep the label in sync with whatever sample is currently active
+    if (inferData.test_idx != null) {
+      document.getElementById('xray-label').textContent =
+        `Test X-Ray — sample #${inferData.test_idx}`;
     }
 
     const imgSrc = imgData.data
