@@ -396,33 +396,37 @@ def api_select_xray(node_id):
         return jsonify({"error": "not found"}), 404
 
     # Find a random image that has 2–8 positive labels so there's a mix of YES/NO
+    # Must cd to REPO first so uv run finds the project's pyproject.toml/uv.lock
     find_cmd = (
+        f"cd {REPO} && "
         f"{_UV_BIN} run python3 -c \""
-        "from medmnist import ChestMNIST; import random, sys; "
-        "sys.stderr = open('/dev/null','w'); "
+        "from medmnist import ChestMNIST; import random; "
         "ds = ChestMNIST(split='test', size=28, download=True); "
         "good = [i for i,(img,lbl) in enumerate(ds) if 2 <= int(lbl.sum()) <= 8]; "
         "print(random.choice(good) if good else random.randint(0, len(ds)-1))"
         "\""
     )
-    out, err = _ssh_exec(node["ip"], find_cmd, timeout=45)
-    if not out or not out.strip().isdigit():
+    out, err = _ssh_exec(node["ip"], find_cmd, timeout=60)
+    # out may contain uv progress lines before the actual number — grab the last digit line
+    digit_line = next((l.strip() for l in reversed((out or "").splitlines()) if l.strip().isdigit()), None)
+    if not digit_line:
         return jsonify({"error": f"Could not pick sample: {err or out}"})
-    idx = int(out.strip())
+    idx = int(digit_line)
 
     # Save index, clear old history/results, generate the PNG for display
     setup_cmd = (
+        f"cd {REPO} && "
         f"echo {idx} > {REPO}/test_xray_idx.txt && "
         f"rm -f {REPO}/test_inference_history.json {REPO}/test_inference_results.json && "
         f"{_UV_BIN} run python3 -c \""
-        f"from medmnist import ChestMNIST; import sys; sys.stderr=open('/dev/null','w'); "
+        f"from medmnist import ChestMNIST; "
         f"ds=ChestMNIST(split='test',size=224,download=True); "
         f"img,lbl=ds[{idx}]; img.convert('L').save('{REPO}/test_xray.png'); "
         f"import json; "
         f"print(json.dumps({{\\\"positives\\\": int(lbl.sum()), \\\"total\\\": len(lbl)}}))"
         f"\" && echo ok"
     )
-    out2, err2 = _ssh_exec(node["ip"], setup_cmd, timeout=45)
+    out2, err2 = _ssh_exec(node["ip"], setup_cmd, timeout=60)
     success = bool(out2 and "ok" in out2)
 
     # Extract label info from python output (line before "ok")
