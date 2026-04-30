@@ -13,3 +13,7 @@ dist/
 build/
 .ipynb_checkpoints/
 analysis.ipynb
+
+# train_ddp.py is the baseline — never commit experiment-modified versions
+# Experiments are saved to experiments/iter-N.py by loop_ddp.sh
+train_ddp.py

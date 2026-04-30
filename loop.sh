@@ -81,7 +81,7 @@ sync_global_results() {
     sort -u -k1,1 /tmp/global_results.tsv \
         | { printf 'commit\tval_auc\tmemory_gb\tstatus\tdescription\n'; cat; } \
         > results.tsv
-    log "Synced: $(grep -c 'keep\|discard' results.tsv 2>/dev/null || echo 0) total experiments across cluster."
+    log "Synced: $(awk -F'\t' '$4 == "keep" || $4 == "discard"' results.tsv 2>/dev/null | wc -l || echo 0) total experiments across cluster."
 }
 
 # ── push local results to origin (cluster only) ──────────────
@@ -156,9 +156,9 @@ for iter in $(seq 1 "$MAX_ITER"); do
 
     sync_global_results
 
-    BEST_AUC=$(grep "keep" results.tsv 2>/dev/null | awk '{print $2}' | sort -n | tail -1)
+    BEST_AUC=$(awk -F'\t' '$4 == "keep" {print $2}' results.tsv 2>/dev/null | sort -n | tail -1)
     BEST_AUC="${BEST_AUC:-0.7255}"
-    TRIED=$(grep -c 'keep\|discard' results.tsv 2>/dev/null || echo 0)
+    TRIED=$(awk -F'\t' '$4 == "keep" || $4 == "discard"' results.tsv 2>/dev/null | wc -l || echo 0)
     log "Global best val_auc=$BEST_AUC  |  Total experiments=$TRIED"
 
     if [ "$CLUSTER_SIZE" -gt 1 ]; then

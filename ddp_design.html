@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4-Node DDP Training Design — BiomedCLIP on NIH ChestX-ray14</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #0d1117; color: #e6edf3; line-height: 1.6; }
+  .page { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+
+  /* Header */
+  .header { text-align: center; padding: 48px 0 40px; border-bottom: 1px solid #21262d; margin-bottom: 48px; }
+  .header h1 { font-size: 2rem; font-weight: 700; color: #58a6ff; letter-spacing: -0.5px; }
+  .header .subtitle { font-size: 1.05rem; color: #8b949e; margin-top: 8px; }
+  .header .badges { display: flex; gap: 10px; justify-content: center; margin-top: 18px; flex-wrap: wrap; }
+  .badge { background: #21262d; border: 1px solid #30363d; border-radius: 20px; padding: 4px 14px; font-size: 0.78rem; color: #8b949e; }
+  .badge span { color: #58a6ff; font-weight: 600; }
+
+  /* Sections */
+  .section { margin-bottom: 56px; }
+  .section-title { font-size: 1.2rem; font-weight: 700; color: #f0f6fc; border-left: 3px solid #58a6ff; padding-left: 12px; margin-bottom: 24px; }
+
+  /* Cards */
+  .card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 24px; margin-bottom: 20px; }
+  .card-title { font-size: 0.85rem; font-weight: 600; color: #58a6ff; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 16px; }
+
+  /* SVG diagrams */
+  svg text { font-family: 'Segoe UI', Arial, sans-serif; }
+  .diagram-wrap { background: #0d1117; border: 1px solid #21262d; border-radius: 10px; padding: 24px; overflow-x: auto; }
+
+  /* Metrics grid */
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; }
+  .metric { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 18px 16px; text-align: center; }
+  .metric .val { font-size: 1.6rem; font-weight: 700; color: #58a6ff; }
+  .metric .lbl { font-size: 0.75rem; color: #8b949e; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th { background: #21262d; color: #8b949e; font-weight: 600; text-align: left; padding: 10px 14px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; }
+  td { padding: 10px 14px; border-bottom: 1px solid #21262d; color: #e6edf3; }
+  tr:last-child td { border-bottom: none; }
+  .tag { display: inline-block; background: #1f6feb33; border: 1px solid #1f6feb66; color: #58a6ff; border-radius: 4px; padding: 1px 8px; font-size: 0.75rem; }
+  .tag.green { background: #2ea04333; border-color: #2ea04366; color: #3fb950; }
+  .tag.orange { background: #d2963333; border-color: #d2963366; color: #d29633; }
+
+  /* Flow steps */
+  .steps { display: flex; flex-direction: column; gap: 0; }
+  .step { display: flex; gap: 16px; align-items: flex-start; padding: 16px 0; border-bottom: 1px solid #21262d; }
+  .step:last-child { border-bottom: none; }
+  .step-num { background: #1f6feb; color: #fff; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 700; flex-shrink: 0; margin-top: 1px; }
+  .step-body h4 { color: #f0f6fc; font-size: 0.95rem; margin-bottom: 4px; }
+  .step-body p { color: #8b949e; font-size: 0.85rem; }
+  code { background: #21262d; padding: 1px 6px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 0.82rem; color: #79c0ff; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- ── Header ─────────────────────────────────────────────────────────── -->
+<div class="header">
+  <h1>4-Node DDP Training — BiomedCLIP on NIH ChestX-ray14</h1>
+  <div class="subtitle">Autonomous X-ray Disease Classification · NVIDIA DGX Spark Cluster</div>
+  <div class="badges">
+    <div class="badge">PyTorch <span>2.13 + CUDA 13.0</span></div>
+    <div class="badge">NCCL <span>2.29.7</span></div>
+    <div class="badge">BiomedCLIP <span>ViT-B/16 86M params</span></div>
+    <div class="badge">Interconnect <span>200 Gbps</span></div>
+    <div class="badge">Global Batch <span>128</span></div>
+  </div>
+</div>
+
+<!-- ── Run Metrics ─────────────────────────────────────────────────────── -->
+<div class="section">
+  <div class="section-title">Run Results (ChestMNIST baseline)</div>
+  <div class="metrics">
+    <div class="metric"><div class="val">0.669</div><div class="lbl">val_auc</div></div>
+    <div class="metric"><div class="val">718s</div><div class="lbl">Training time</div></div>
+    <div class="metric"><div class="val">1839</div><div class="lbl">Steps</div></div>
+    <div class="metric"><div class="val">128</div><div class="lbl">Global batch</div></div>
+    <div class="metric"><div class="val">5.3 GB</div><div class="lbl">Peak VRAM / node</div></div>
+    <div class="metric"><div class="val">86.2M</div><div class="lbl">Parameters</div></div>
+  </div>
+</div>
+
+<!-- ── Diagram 1: Cluster Topology ────────────────────────────────────── -->
+<div class="section">
+  <div class="section-title">Cluster Topology</div>
+  <div class="diagram-wrap">
+  <svg viewBox="0 0 1020 420" width="100%" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#58a6ff" opacity="0.7"/>
+      </marker>
+      <marker id="arr2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#3fb950" opacity="0.8"/>
+      </marker>
+      <filter id="glow">
+        <feGaussianBlur stdDeviation="2" result="blur"/>
+        <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+    </defs>
+
+    <!-- Background lanes -->
+    <rect x="10" y="10" width="1000" height="400" rx="12" fill="#161b22" stroke="#21262d" stroke-width="1"/>
+
+    <!-- Section labels -->
+    <text x="30" y="38" font-size="11" fill="#8b949e" font-weight="600" letter-spacing="1">MANAGEMENT NETWORK  (10.137.203.x)</text>
+    <text x="30" y="240" font-size="11" fill="#8b949e" font-weight="600" letter-spacing="1">HIGH-SPEED INTERCONNECT  (100.100.100.x · 200 Gbps)</text>
+
+    <!-- Divider -->
+    <line x1="30" y1="248" x2="990" y2="248" stroke="#21262d" stroke-width="1" stroke-dasharray="6,4"/>
+
+    <!-- ── Node boxes (top row — management) ── -->
+    <!-- node-0 (master) -->
+    <rect x="50" y="55" width="200" height="160" rx="8" fill="#1a2332" stroke="#1f6feb" stroke-width="2"/>
+    <rect x="50" y="55" width="200" height="28" rx="8" fill="#1f6feb"/>
+    <rect x="50" y="75" width="200" height="8" fill="#1f6feb"/>
+    <text x="150" y="73" font-size="12" fill="#fff" text-anchor="middle" font-weight="700">node-0  (MASTER / Rank 0)</text>
+    <text x="150" y="105" font-size="11" fill="#79c0ff" text-anchor="middle">10.137.203.228</text>
+    <text x="150" y="122" font-size="11" fill="#8b949e" text-anchor="middle">NVIDIA GB200 · 1× GPU</text>
+    <rect x="70" y="135" width="160" height="28" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="150" y="153" font-size="11" fill="#3fb950" text-anchor="middle">TCPStore rendezvous</text>
+    <rect x="70" y="170" width="160" height="28" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="150" y="188" font-size="11" fill="#58a6ff" text-anchor="middle">Rank 0 · LOCAL_RANK 0</text>
+
+    <!-- node-1 -->
+    <rect x="280" y="55" width="200" height="160" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+    <rect x="280" y="55" width="200" height="28" rx="8" fill="#21262d"/>
+    <rect x="280" y="75" width="200" height="8" fill="#21262d"/>
+    <text x="380" y="73" font-size="12" fill="#e6edf3" text-anchor="middle" font-weight="700">node-1  (Rank 1)</text>
+    <text x="380" y="105" font-size="11" fill="#79c0ff" text-anchor="middle">10.137.203.184</text>
+    <text x="380" y="122" font-size="11" fill="#8b949e" text-anchor="middle">NVIDIA GB200 · 1× GPU</text>
+    <rect x="300" y="135" width="160" height="28" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="380" y="153" font-size="11" fill="#8b949e" text-anchor="middle">Worker node</text>
+    <rect x="300" y="170" width="160" height="28" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="380" y="188" font-size="11" fill="#58a6ff" text-anchor="middle">Rank 1 · LOCAL_RANK 0</text>
+
+    <!-- node-2 -->
+    <rect x="510" y="55" width="200" height="160" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+    <rect x="510" y="55" width="200" height="28" rx="8" fill="#21262d"/>
+    <rect x="510" y="75" width="200" height="8" fill="#21262d"/>
+    <text x="610" y="73" font-size="12" fill="#e6edf3" text-anchor="middle" font-weight="700">node-2  (Rank 2)</text>
+    <text x="610" y="105" font-size="11" fill="#79c0ff" text-anchor="middle">10.137.203.174</text>
+    <text x="610" y="122" font-size="11" fill="#8b949e" text-anchor="middle">NVIDIA GB200 · 1× GPU</text>
+    <rect x="530" y="135" width="160" height="28" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="610" y="153" font-size="11" fill="#8b949e" text-anchor="middle">Worker node</text>
+    <rect x="530" y="170" width="160" height="28" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="610" y="188" font-size="11" fill="#58a6ff" text-anchor="middle">Rank 2 · LOCAL_RANK 0</text>
+
+    <!-- node-3 -->
+    <rect x="740" y="55" width="200" height="160" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+    <rect x="740" y="55" width="200" height="28" rx="8" fill="#21262d"/>
+    <rect x="740" y="75" width="200" height="8" fill="#21262d"/>
+    <text x="840" y="73" font-size="12" fill="#e6edf3" text-anchor="middle" font-weight="700">node-3  (Rank 3)</text>
+    <text x="840" y="105" font-size="11" fill="#79c0ff" text-anchor="middle">10.137.203.177</text>
+    <text x="840" y="122" font-size="11" fill="#8b949e" text-anchor="middle">NVIDIA GB200 · 1× GPU</text>
+    <rect x="760" y="135" width="160" height="28" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="840" y="153" font-size="11" fill="#8b949e" text-anchor="middle">Worker node</text>
+    <rect x="760" y="170" width="160" height="28" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="840" y="188" font-size="11" fill="#58a6ff" text-anchor="middle">Rank 3 · LOCAL_RANK 0</text>
+
+    <!-- Management connections (dashed blue) -->
+    <line x1="250" y1="135" x2="280" y2="135" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+    <line x1="480" y1="135" x2="510" y2="135" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+    <line x1="710" y1="135" x2="740" y2="135" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr)"/>
+    <text x="265" y="128" font-size="9" fill="#58a6ff" text-anchor="middle">init</text>
+    <text x="495" y="128" font-size="9" fill="#58a6ff" text-anchor="middle">init</text>
+    <text x="725" y="128" font-size="9" fill="#58a6ff" text-anchor="middle">init</text>
+
+    <!-- ── Interconnect nodes (bottom row) ── -->
+    <rect x="50"  y="265" width="200" height="110" rx="8" fill="#1a2a1a" stroke="#2ea043" stroke-width="2"/>
+    <rect x="280" y="265" width="200" height="110" rx="8" fill="#1a2a1a" stroke="#2ea043" stroke-width="1.5"/>
+    <rect x="510" y="265" width="200" height="110" rx="8" fill="#1a2a1a" stroke="#2ea043" stroke-width="1.5"/>
+    <rect x="740" y="265" width="200" height="110" rx="8" fill="#1a2a1a" stroke="#2ea043" stroke-width="1.5"/>
+
+    <text x="150" y="288" font-size="11" fill="#3fb950" text-anchor="middle" font-weight="600">enp1s0f0np0</text>
+    <text x="150" y="305" font-size="11" fill="#79c0ff" text-anchor="middle">100.100.100.10</text>
+    <text x="150" y="322" font-size="10" fill="#8b949e" text-anchor="middle">NCCL_SOCKET_IFNAME</text>
+    <text x="150" y="352" font-size="13" fill="#3fb950" text-anchor="middle" font-weight="700">200 Gbps</text>
+    <text x="150" y="368" font-size="10" fill="#8b949e" text-anchor="middle">AllReduce / gradient sync</text>
+
+    <text x="380" y="288" font-size="11" fill="#3fb950" text-anchor="middle" font-weight="600">enp1s0f0np0</text>
+    <text x="380" y="305" font-size="11" fill="#79c0ff" text-anchor="middle">100.100.100.12</text>
+    <text x="380" y="322" font-size="10" fill="#8b949e" text-anchor="middle">NCCL_SOCKET_IFNAME</text>
+    <text x="380" y="352" font-size="13" fill="#3fb950" text-anchor="middle" font-weight="700">200 Gbps</text>
+    <text x="380" y="368" font-size="10" fill="#8b949e" text-anchor="middle">AllReduce / gradient sync</text>
+
+    <text x="610" y="288" font-size="11" fill="#3fb950" text-anchor="middle" font-weight="600">enp1s0f0np0</text>
+    <text x="610" y="305" font-size="11" fill="#79c0ff" text-anchor="middle">100.100.100.14</text>
+    <text x="610" y="322" font-size="10" fill="#8b949e" text-anchor="middle">NCCL_SOCKET_IFNAME</text>
+    <text x="610" y="352" font-size="13" fill="#3fb950" text-anchor="middle" font-weight="700">200 Gbps</text>
+    <text x="610" y="368" font-size="10" fill="#8b949e" text-anchor="middle">AllReduce / gradient sync</text>
+
+    <text x="840" y="288" font-size="11" fill="#3fb950" text-anchor="middle" font-weight="600">enp1s0f0np0</text>
+    <text x="840" y="305" font-size="11" fill="#79c0ff" text-anchor="middle">100.100.100.16</text>
+    <text x="840" y="322" font-size="10" fill="#8b949e" text-anchor="middle">NCCL_SOCKET_IFNAME</text>
+    <text x="840" y="352" font-size="13" fill="#3fb950" text-anchor="middle" font-weight="700">200 Gbps</text>
+    <text x="840" y="368" font-size="10" fill="#8b949e" text-anchor="middle">AllReduce / gradient sync</text>
+
+    <!-- Vertical connectors: mgmt → interconnect -->
+    <line x1="150" y1="215" x2="150" y2="265" stroke="#30363d" stroke-width="1.5"/>
+    <line x1="380" y1="215" x2="380" y2="265" stroke="#30363d" stroke-width="1.5"/>
+    <line x1="610" y1="215" x2="610" y2="265" stroke="#30363d" stroke-width="1.5"/>
+    <line x1="840" y1="215" x2="840" y2="265" stroke="#30363d" stroke-width="1.5"/>
+
+    <!-- Horizontal interconnect bus -->
+    <line x1="250" y1="330" x2="280" y2="330" stroke="#3fb950" stroke-width="2.5" marker-end="url(#arr2)"/>
+    <line x1="480" y1="330" x2="510" y2="330" stroke="#3fb950" stroke-width="2.5" marker-end="url(#arr2)"/>
+    <line x1="710" y1="330" x2="740" y2="330" stroke="#3fb950" stroke-width="2.5" marker-end="url(#arr2)"/>
+    <line x1="280" y1="345" x2="250" y2="345" stroke="#3fb950" stroke-width="2.5" marker-end="url(#arr2)"/>
+    <line x1="510" y1="345" x2="480" y2="345" stroke="#3fb950" stroke-width="2.5" marker-end="url(#arr2)"/>
+    <line x1="740" y1="345" x2="710" y2="345" stroke="#3fb950" stroke-width="2.5" marker-end="url(#arr2)"/>
+  </svg>
+  </div>
+</div>
+
+<!-- ── Diagram 2: DDP Training Flow ───────────────────────────────────── -->
+<div class="section">
+  <div class="section-title">DDP Forward / Backward Pass</div>
+  <div class="diagram-wrap">
+  <svg viewBox="0 0 1020 380" width="100%" xmlns="http://www.w3.org/2000/svg">
+
+    <!-- Background -->
+    <rect x="10" y="10" width="1000" height="360" rx="12" fill="#161b22" stroke="#21262d"/>
+
+    <!-- Phase labels -->
+    <text x="30" y="36" font-size="11" fill="#8b949e" font-weight="600" letter-spacing="1">EACH TRAINING STEP  (×1839 steps · 3 epochs)</text>
+
+    <!-- Node columns -->
+    <!-- node-0 -->
+    <rect x="40" y="52" width="190" height="290" rx="6" fill="#1a2332" stroke="#1f6feb" stroke-width="1.5"/>
+    <text x="135" y="72" font-size="11" fill="#58a6ff" text-anchor="middle" font-weight="700">node-0 (Rank 0)</text>
+
+    <!-- node-1 -->
+    <rect x="275" y="52" width="190" height="290" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <text x="370" y="72" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="700">node-1 (Rank 1)</text>
+
+    <!-- node-2 -->
+    <rect x="510" y="52" width="190" height="290" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <text x="605" y="72" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="700">node-2 (Rank 2)</text>
+
+    <!-- node-3 -->
+    <rect x="745" y="52" width="190" height="290" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <text x="840" y="72" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="700">node-3 (Rank 3)</text>
+
+    <!-- Step rows -->
+    <!-- ROW 1: Sample shard -->
+    <rect x="52"  y="85" width="166" height="36" rx="5" fill="#1f3a5f" stroke="#1f6feb55"/>
+    <rect x="287" y="85" width="166" height="36" rx="5" fill="#1f3a5f" stroke="#1f6feb55"/>
+    <rect x="522" y="85" width="166" height="36" rx="5" fill="#1f3a5f" stroke="#1f6feb55"/>
+    <rect x="757" y="85" width="166" height="36" rx="5" fill="#1f3a5f" stroke="#1f6feb55"/>
+    <text x="135" y="107" font-size="11" fill="#79c0ff" text-anchor="middle">Batch shard [0..31]</text>
+    <text x="370" y="107" font-size="11" fill="#79c0ff" text-anchor="middle">Batch shard [32..63]</text>
+    <text x="605" y="107" font-size="11" fill="#79c0ff" text-anchor="middle">Batch shard [64..95]</text>
+    <text x="840" y="107" font-size="11" fill="#79c0ff" text-anchor="middle">Batch shard [96..127]</text>
+    <text x="135" y="119" font-size="9.5" fill="#8b949e" text-anchor="middle">DistributedSampler</text>
+    <text x="370" y="119" font-size="9.5" fill="#8b949e" text-anchor="middle">DistributedSampler</text>
+    <text x="605" y="119" font-size="9.5" fill="#8b949e" text-anchor="middle">DistributedSampler</text>
+    <text x="840" y="119" font-size="9.5" fill="#8b949e" text-anchor="middle">DistributedSampler</text>
+
+    <!-- ROW 2: Forward -->
+    <rect x="52"  y="140" width="166" height="44" rx="5" fill="#1a3320" stroke="#2ea04355"/>
+    <rect x="287" y="140" width="166" height="44" rx="5" fill="#1a3320" stroke="#2ea04355"/>
+    <rect x="522" y="140" width="166" height="44" rx="5" fill="#1a3320" stroke="#2ea04355"/>
+    <rect x="757" y="140" width="166" height="44" rx="5" fill="#1a3320" stroke="#2ea04355"/>
+    <text x="135" y="160" font-size="11" fill="#3fb950" text-anchor="middle">Forward Pass</text>
+    <text x="135" y="175" font-size="9.5" fill="#8b949e" text-anchor="middle">BiomedCLIP ViT-B/16 → Linear(14)</text>
+    <text x="370" y="160" font-size="11" fill="#3fb950" text-anchor="middle">Forward Pass</text>
+    <text x="370" y="175" font-size="9.5" fill="#8b949e" text-anchor="middle">BiomedCLIP ViT-B/16 → Linear(14)</text>
+    <text x="605" y="160" font-size="11" fill="#3fb950" text-anchor="middle">Forward Pass</text>
+    <text x="605" y="175" font-size="9.5" fill="#8b949e" text-anchor="middle">BiomedCLIP ViT-B/16 → Linear(14)</text>
+    <text x="840" y="160" font-size="11" fill="#3fb950" text-anchor="middle">Forward Pass</text>
+    <text x="840" y="175" font-size="9.5" fill="#8b949e" text-anchor="middle">BiomedCLIP ViT-B/16 → Linear(14)</text>
+
+    <!-- ROW 3: Loss -->
+    <rect x="52"  y="200" width="166" height="36" rx="5" fill="#2d1a1a" stroke="#f8514955"/>
+    <rect x="287" y="200" width="166" height="36" rx="5" fill="#2d1a1a" stroke="#f8514955"/>
+    <rect x="522" y="200" width="166" height="36" rx="5" fill="#2d1a1a" stroke="#f8514955"/>
+    <rect x="757" y="200" width="166" height="36" rx="5" fill="#2d1a1a" stroke="#f8514955"/>
+    <text x="135" y="220" font-size="11" fill="#f85149" text-anchor="middle">loss.backward()</text>
+    <text x="135" y="232" font-size="9.5" fill="#8b949e" text-anchor="middle">BCEWithLogitsLoss · local grad</text>
+    <text x="370" y="220" font-size="11" fill="#f85149" text-anchor="middle">loss.backward()</text>
+    <text x="370" y="232" font-size="9.5" fill="#8b949e" text-anchor="middle">BCEWithLogitsLoss · local grad</text>
+    <text x="605" y="220" font-size="11" fill="#f85149" text-anchor="middle">loss.backward()</text>
+    <text x="605" y="232" font-size="9.5" fill="#8b949e" text-anchor="middle">BCEWithLogitsLoss · local grad</text>
+    <text x="840" y="220" font-size="11" fill="#f85149" text-anchor="middle">loss.backward()</text>
+    <text x="840" y="232" font-size="9.5" fill="#8b949e" text-anchor="middle">BCEWithLogitsLoss · local grad</text>
+
+    <!-- NCCL AllReduce bar -->
+    <rect x="40" y="252" width="920" height="32" rx="6" fill="#1a2d1a" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="500" y="272" font-size="12" fill="#3fb950" text-anchor="middle" font-weight="700">NCCL AllReduce — gradient averaging across all 4 GPUs (200 Gbps interconnect)</text>
+
+    <!-- ROW 4: Optimizer -->
+    <rect x="52"  y="300" width="166" height="34" rx="5" fill="#21262d" stroke="#30363d"/>
+    <rect x="287" y="300" width="166" height="34" rx="5" fill="#21262d" stroke="#30363d"/>
+    <rect x="522" y="300" width="166" height="34" rx="5" fill="#21262d" stroke="#30363d"/>
+    <rect x="757" y="300" width="166" height="34" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="135" y="320" font-size="11" fill="#e6edf3" text-anchor="middle">AdamW step</text>
+    <text x="135" y="332" font-size="9.5" fill="#8b949e" text-anchor="middle">identical weights on all nodes</text>
+    <text x="370" y="320" font-size="11" fill="#e6edf3" text-anchor="middle">AdamW step</text>
+    <text x="370" y="332" font-size="9.5" fill="#8b949e" text-anchor="middle">identical weights on all nodes</text>
+    <text x="605" y="320" font-size="11" fill="#e6edf3" text-anchor="middle">AdamW step</text>
+    <text x="605" y="332" font-size="9.5" fill="#8b949e" text-anchor="middle">identical weights on all nodes</text>
+    <text x="840" y="320" font-size="11" fill="#e6edf3" text-anchor="middle">AdamW step</text>
+    <text x="840" y="332" font-size="9.5" fill="#8b949e" text-anchor="middle">identical weights on all nodes</text>
+
+    <!-- Step arrows between rows -->
+    <line x1="135" y1="121" x2="135" y2="140" stroke="#30363d" stroke-width="1"/>
+    <line x1="370" y1="121" x2="370" y2="140" stroke="#30363d" stroke-width="1"/>
+    <line x1="605" y1="121" x2="605" y2="140" stroke="#30363d" stroke-width="1"/>
+    <line x1="840" y1="121" x2="840" y2="140" stroke="#30363d" stroke-width="1"/>
+
+    <line x1="135" y1="184" x2="135" y2="200" stroke="#30363d" stroke-width="1"/>
+    <line x1="370" y1="184" x2="370" y2="200" stroke="#30363d" stroke-width="1"/>
+    <line x1="605" y1="184" x2="605" y2="200" stroke="#30363d" stroke-width="1"/>
+    <line x1="840" y1="184" x2="840" y2="200" stroke="#30363d" stroke-width="1"/>
+
+    <line x1="135" y1="236" x2="135" y2="252" stroke="#30363d" stroke-width="1"/>
+    <line x1="840" y1="236" x2="840" y2="252" stroke="#30363d" stroke-width="1"/>
+    <line x1="135" y1="284" x2="135" y2="300" stroke="#30363d" stroke-width="1"/>
+    <line x1="840" y1="284" x2="840" y2="300" stroke="#30363d" stroke-width="1"/>
+  </svg>
+  </div>
+</div>
+
+<!-- ── Diagram 3: Software Stack ──────────────────────────────────────── -->
+<div class="section">
+  <div class="section-title">Software Stack</div>
+  <div class="diagram-wrap">
+  <svg viewBox="0 0 1020 260" width="100%" xmlns="http://www.w3.org/2000/svg">
+    <rect x="10" y="10" width="1000" height="240" rx="12" fill="#161b22" stroke="#21262d"/>
+
+    <!-- Stack layers (each node gets same stack, shown once for clarity) -->
+    <!-- Labels on left -->
+    <text x="30" y="55"  font-size="10" fill="#8b949e" font-weight="600">APPLICATION</text>
+    <text x="30" y="100" font-size="10" fill="#8b949e" font-weight="600">DDP LAYER</text>
+    <text x="30" y="145" font-size="10" fill="#8b949e" font-weight="600">COMMS</text>
+    <text x="30" y="190" font-size="10" fill="#8b949e" font-weight="600">HARDWARE</text>
+    <text x="30" y="235" font-size="10" fill="#8b949e" font-weight="600">NETWORK</text>
+
+    <!-- Application row: 4 columns -->
+    <rect x="120" y="36" width="195" height="30" rx="5" fill="#1f3a5f" stroke="#1f6feb55"/>
+    <rect x="335" y="36" width="195" height="30" rx="5" fill="#21262d" stroke="#30363d"/>
+    <rect x="550" y="36" width="195" height="30" rx="5" fill="#21262d" stroke="#30363d"/>
+    <rect x="765" y="36" width="195" height="30" rx="5" fill="#21262d" stroke="#30363d"/>
+    <text x="217" y="55" font-size="11" fill="#79c0ff" text-anchor="middle">train_ddp.py + prepare.py</text>
+    <text x="432" y="55" font-size="11" fill="#8b949e" text-anchor="middle">train_ddp.py + prepare.py</text>
+    <text x="647" y="55" font-size="11" fill="#8b949e" text-anchor="middle">train_ddp.py + prepare.py</text>
+    <text x="862" y="55" font-size="11" fill="#8b949e" text-anchor="middle">train_ddp.py + prepare.py</text>
+
+    <!-- DDP row -->
+    <rect x="120" y="80" width="195" height="30" rx="5" fill="#1a3320" stroke="#2ea04355"/>
+    <rect x="335" y="80" width="195" height="30" rx="5" fill="#1a3320" stroke="#2ea04355"/>
+    <rect x="550" y="80" width="195" height="30" rx="5" fill="#1a3320" stroke="#2ea04355"/>
+    <rect x="765" y="80" width="195" height="30" rx="5" fill="#1a3320" stroke="#2ea04355"/>
+    <text x="217" y="99" font-size="11" fill="#3fb950" text-anchor="middle">DistributedDataParallel</text>
+    <text x="432" y="99" font-size="11" fill="#3fb950" text-anchor="middle">DistributedDataParallel</text>
+    <text x="647" y="99" font-size="11" fill="#3fb950" text-anchor="middle">DistributedDataParallel</text>
+    <text x="862" y="99" font-size="11" fill="#3fb950" text-anchor="middle">DistributedDataParallel</text>
+
+    <!-- Comms row -->
+    <rect x="120" y="124" width="840" height="30" rx="5" fill="#1a2d1a" stroke="#3fb95055"/>
+    <text x="540" y="143" font-size="12" fill="#3fb950" text-anchor="middle" font-weight="600">NCCL 2.29.7 — AllReduce (Ring) · TCPStore rendezvous (env:// · port 29500)</text>
+
+    <!-- Hardware row -->
+    <rect x="120" y="168" width="195" height="30" rx="5" fill="#2d2a1a" stroke="#d2963355"/>
+    <rect x="335" y="168" width="195" height="30" rx="5" fill="#2d2a1a" stroke="#d2963355"/>
+    <rect x="550" y="168" width="195" height="30" rx="5" fill="#2d2a1a" stroke="#d2963355"/>
+    <rect x="765" y="168" width="195" height="30" rx="5" fill="#2d2a1a" stroke="#d2963355"/>
+    <text x="217" y="187" font-size="11" fill="#d29633" text-anchor="middle">NVIDIA GB200 GPU</text>
+    <text x="432" y="187" font-size="11" fill="#d29633" text-anchor="middle">NVIDIA GB200 GPU</text>
+    <text x="647" y="187" font-size="11" fill="#d29633" text-anchor="middle">NVIDIA GB200 GPU</text>
+    <text x="862" y="187" font-size="11" fill="#d29633" text-anchor="middle">NVIDIA GB200 GPU</text>
+
+    <!-- Network row -->
+    <rect x="120" y="212" width="840" height="30" rx="5" fill="#1a2a1a" stroke="#3fb95055"/>
+    <text x="540" y="231" font-size="11" fill="#3fb950" text-anchor="middle">200 Gbps High-Speed Interconnect · 100.100.100.x · enp1s0f0np0</text>
+
+    <!-- Column headers -->
+    <text x="217" y="26" font-size="10" fill="#58a6ff" text-anchor="middle" font-weight="700">NODE-0 (MASTER)</text>
+    <text x="432" y="26" font-size="10" fill="#8b949e" text-anchor="middle" font-weight="700">NODE-1</text>
+    <text x="647" y="26" font-size="10" fill="#8b949e" text-anchor="middle" font-weight="700">NODE-2</text>
+    <text x="862" y="26" font-size="10" fill="#8b949e" text-anchor="middle" font-weight="700">NODE-3</text>
+  </svg>
+  </div>
+</div>
+
+<!-- ── Diagram 4: Launch Sequence ─────────────────────────────────────── -->
+<div class="section">
+  <div class="section-title">Launch Sequence (launch_ddp.py)</div>
+  <div class="card">
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <h4>Prepare all nodes in parallel</h4>
+          <p>SSH into all 4 nodes simultaneously. Check &amp; install <code>open-clip-torch</code> and <code>transformers</code>. Upload <code>train_ddp.py</code>, <code>prepare.py</code>. Pre-download BiomedCLIP weights from HuggingFace Hub so they're cached before training starts.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <h4>Launch training on all nodes simultaneously</h4>
+          <p>SSH exec on all 4 nodes at once via <code>ThreadPoolExecutor</code>. Each node runs <code>RANK=N WORLD_SIZE=4 MASTER_ADDR=10.137.203.228 MASTER_PORT=29500 python train_ddp.py</code>. NCCL routes gradient traffic over <code>NCCL_SOCKET_IFNAME=enp1s0f0np0</code>.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <h4>Rendezvous via env:// (TCPStore)</h4>
+          <p><code>dist.init_process_group(backend='nccl', init_method='env://')</code>. Node-0 (rank 0) starts the TCPStore server on port 29500. Ranks 1–3 connect as clients. All 4 confirm <code>world_size=4</code> before training begins.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div class="step-body">
+          <h4>Synchronized training budget</h4>
+          <p><code>dist.barrier()</code> ensures all ranks start their 600s timer simultaneously. Each rank runs its shard of the data through BiomedCLIP + classifier head. Gradients are AllReduced after each backward pass. All ranks exit the loop at the same epoch boundary.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">5</div>
+        <div class="step-body">
+          <h4>Evaluation &amp; results (rank 0 only)</h4>
+          <p>After <code>dist.barrier()</code>, rank 0 runs <code>evaluate_auc()</code> on the validation set, saves <code>trained_model.pth</code>, and prints final metrics. <code>launch_ddp.py</code> streams all rank-0 output back to the laptop and summarizes val_auc.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Node Config Table ───────────────────────────────────────────────── -->
+<div class="section">
+  <div class="section-title">Node Configuration</div>
+  <div class="card" style="padding:0; overflow:hidden;">
+    <table>
+      <thead>
+        <tr>
+          <th>Node</th><th>Role</th><th>Management IP</th><th>Interconnect IP</th><th>Rank</th><th>PyTorch</th><th>NCCL</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>node-0</strong></td>
+          <td><span class="tag">Master · TCPStore server</span></td>
+          <td><code>10.137.203.228</code></td>
+          <td><code>100.100.100.10</code></td>
+          <td><span class="tag">0</span></td>
+          <td>2.13.0+cu130</td>
+          <td>2.29.7</td>
+        </tr>
+        <tr>
+          <td><strong>node-1</strong></td>
+          <td><span class="tag green">Worker</span></td>
+          <td><code>10.137.203.184</code></td>
+          <td><code>100.100.100.12</code></td>
+          <td><span class="tag">1</span></td>
+          <td>2.13.0+cu130</td>
+          <td>2.29.7</td>
+        </tr>
+        <tr>
+          <td><strong>node-2</strong></td>
+          <td><span class="tag green">Worker</span></td>
+          <td><code>10.137.203.174</code></td>
+          <td><code>100.100.100.14</code></td>
+          <td><span class="tag">2</span></td>
+          <td>2.13.0+cu130</td>
+          <td>2.29.7</td>
+        </tr>
+        <tr>
+          <td><strong>node-3</strong></td>
+          <td><span class="tag green">Worker</span></td>
+          <td><code>10.137.203.177</code></td>
+          <td><code>100.100.100.16</code></td>
+          <td><span class="tag">3</span></td>
+          <td>2.13.0+cu130</td>
+          <td>2.29.7</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── Hyperparams Table ───────────────────────────────────────────────── -->
+<div class="section">
+  <div class="section-title">Training Hyperparameters</div>
+  <div class="card" style="padding:0; overflow:hidden;">
+    <table>
+      <thead><tr><th>Parameter</th><th>Value</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td>Model</td><td><code>microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224</code></td><td>ViT-B/16 pretrained on 15M biomedical image-text pairs</td></tr>
+        <tr><td>Head</td><td><code>nn.Linear(512, 14)</code></td><td>14 disease classes</td></tr>
+        <tr><td>Per-node batch</td><td>32</td><td>Global batch = 32 × 4 = <strong>128</strong></td></tr>
+        <tr><td>Base LR</td><td>1×10⁻⁴ × (128/32) = 4×10⁻⁴</td><td>Linear scaling rule</td></tr>
+        <tr><td>Optimizer</td><td>AdamW · weight_decay=1e-4</td><td>Gradient clip norm=1.0</td></tr>
+        <tr><td>Scheduler</td><td>CosineAnnealingLR</td><td>T_max = TIME_BUDGET / 5</td></tr>
+        <tr><td>Loss</td><td>BCEWithLogitsLoss</td><td>Multi-label classification</td></tr>
+        <tr><td>Training budget</td><td>600s</td><td>Clock started after dist.barrier()</td></tr>
+        <tr><td>Init method</td><td>env:// (TCPStore)</td><td>No torchrun — direct python3 invocation</td></tr>
+        <tr><td>Gradient sync</td><td>NCCL AllReduce (Ring)</td><td>Over 200 Gbps interconnect</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Footer -->
+<div style="text-align:center; padding:24px 0 8px; color:#8b949e; font-size:0.8rem; border-top:1px solid #21262d;">
+  AutoResearch · Autonomous X-ray Disease Classification · NVIDIA DGX Spark · 2026
+</div>
+
+</div>
+</body>
+</html>
