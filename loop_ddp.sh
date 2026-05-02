@@ -173,6 +173,10 @@ done
 wait
 log "best_model.pth cleared on all nodes — starting from BiomedCLIP pretrained weights."
 
+# Reset results.tsv so OpenCode has no memory of previous loop runs
+printf 'commit\tval_auc\tmemory_gb\tstatus\tdescription\n' > "$REPO_DIR/results.tsv"
+log "results.tsv reset — fresh experiment history for this run."
+
 # ── main loop ─────────────────────────────────────────────────
 for iter in $(seq 1 "$MAX_ITER"); do
     log "══════ Iteration $iter / $MAX_ITER ══════"
