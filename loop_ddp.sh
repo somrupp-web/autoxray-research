@@ -111,6 +111,34 @@ log "OpenCode : $OPENCODE"
 log "Model    : $MODEL"
 log "Max iter : $MAX_ITER  |  Epochs/iter: $EPOCHS_PER_ITER"
 
+# ── ensure vLLM is running — restart if crashed ───────────────
+VLLM_START_SCRIPT="/tmp/start_qwen_vllm.sh"
+VLLM_LOG="/tmp/vllm_qwen.log"
+
+if curl -sf http://127.0.0.1:8080/v1/models > /dev/null 2>&1; then
+    log "vLLM already ready on :8080."
+else
+    log "vLLM not responding on :8080 — checking process..."
+    if pgrep -f "vllm serve" > /dev/null 2>&1; then
+        log "vLLM process exists but not ready yet — will wait."
+    else
+        log "vLLM process not found — restarting..."
+        pkill -9 -f "vllm" 2>/dev/null; sleep 2
+        if [ -f "$VLLM_START_SCRIPT" ]; then
+            log "Starting vLLM via $VLLM_START_SCRIPT ..."
+            bash "$VLLM_START_SCRIPT" &
+        else
+            log "Start script not found — launching vLLM with defaults..."
+            export MAX_JOBS=4
+            /home/nvidia/vllm-env/bin/vllm serve /home/nvidia/models/Qwen3.5-122B-A10B-AWQ \
+                --port 8080 --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+                --max-model-len 65536 --gpu-memory-utilization 0.85 \
+                --compilation-config '{"mode": 0}' >> "$VLLM_LOG" 2>&1 &
+        fi
+        log "vLLM restart initiated (PID $!) — waiting for it to become ready..."
+    fi
+fi
+
 # ── wait for vLLM on node-0 ───────────────────────────────────
 log "Waiting for vLLM on :8080 (up to 35 min for large model load)..."
 for i in $(seq 1 420); do
@@ -129,13 +157,29 @@ else
     log "Baseline exists: train_ddp.py.baseline"
 fi
 
+# ── best code — always reset to baseline at loop start ────────
+# Within this run, BEST_CODE accumulates improvements iteration by iteration.
+# A new loop invocation always starts fresh from baseline + BiomedCLIP pretrained.
+BEST_CODE="$REPO_DIR/train_ddp.py.best"
+cp "$BASELINE" "$BEST_CODE"
+log "Best code reset to baseline for this run."
+
+# Clear best_model.pth so train_ddp.py starts from BiomedCLIP pretrained weights
+rm -f "$REPO_DIR/best_model.pth"
+for rank in 1 2 3; do
+    ssh $SSH_OPTS "nvidia@${NODE_MGT_IPS[$rank]}" "rm -f $REPO_DIR/best_model.pth" \
+        || log "WARNING: could not clear best_model.pth on node-${rank} — may use stale weights on first iter" &
+done
+wait
+log "best_model.pth cleared on all nodes — starting from BiomedCLIP pretrained weights."
+
 # ── main loop ─────────────────────────────────────────────────
 for iter in $(seq 1 "$MAX_ITER"); do
     log "══════ Iteration $iter / $MAX_ITER ══════"
 
-    # Always reset to baseline so OpenCode starts from the same clean slate
-    cp "$BASELINE" "$REPO_DIR/train_ddp.py"
-    log "Reset train_ddp.py to baseline."
+    # Reset to best code so OpenCode builds on the best result so far
+    cp "$BEST_CODE" "$REPO_DIR/train_ddp.py"
+    log "Reset train_ddp.py to best code."
 
     # Global best from results.tsv
     BEST_AUC=$(awk -F'\t' '$4 == "keep" {print $2}' results.tsv 2>/dev/null | sort -n | tail -1)
@@ -150,18 +194,29 @@ Your goal: improve chest X-ray disease classification on NIH ChestX-ray14 (Huggi
 Metric: val_auc (mean AUC-ROC across 14 diseases, higher is better).
 Current best val_auc=${BEST_AUC}. Target: beat CheXNet benchmark of 0.841.
 
+IMPORTANT CONTEXT:
+- train_ddp.py already contains the BEST code from all previous iterations (not the original baseline).
+- best_model.pth contains the BEST weights from all previous training runs and will be loaded
+  automatically at the start of training via strict=False. You do NOT need to load it yourself.
+- Each iteration builds on the best result so far — the model keeps improving.
+- Choose an improvement that builds on what is already working, not a completely different approach.
+
 Steps you MUST follow exactly:
 1. Read /home/nvidia/autoresearch/train_ddp.py
 2. Read /home/nvidia/autoresearch/results.tsv
 3. Read /home/nvidia/autoresearch/program_ddp.md
 4. Choose ONE specific improvement not yet tried that could beat val_auc=${BEST_AUC}
-5. Write the complete new train_ddp.py using the bash tool:
-   cat > /home/nvidia/autoresearch/train_ddp.py << 'PYEOF'
-   [complete new python file]
-   PYEOF
+5. Use the Edit tool to modify ONLY the code inside the EXPERIMENT section markers in
+   /home/nvidia/autoresearch/train_ddp.py. The four editable sections are:
+     CLASSIFIER_HEAD  — model architecture / head layers
+     TRANSFORMS       — data augmentation (PIL.Image input, must stay tensor-compatible)
+     OPTIMIZER        — optimizer, scheduler, criterion, lr, weight_decay
+     TRAIN_STEP       — per-batch forward / backward / grad-clip / optimizer step
+   Edit one or more sections. Leave all other code untouched.
 6. Stop. Do not run training yourself.
 
-IMPORTANT: Use bash to write the file (step 5). Do NOT use the edit tool."
+IMPORTANT: Use the Edit tool only (step 5).
+DO NOT rewrite the entire file. DO NOT use bash cat > to overwrite train_ddp.py."
 
     log "Running OpenCode agent (iter $iter)..."
     "$OPENCODE" run --model "$MODEL" "$PROMPT"
@@ -169,7 +224,7 @@ IMPORTANT: Use bash to write the file (step 5). Do NOT use the edit tool."
 
     if [ $OPENCODE_EXIT -ne 0 ]; then
         log "WARNING: OpenCode exited $OPENCODE_EXIT — skipping."
-        cp "$BASELINE" "$REPO_DIR/train_ddp.py"
+        cp "$BEST_CODE" "$REPO_DIR/train_ddp.py"
         continue
     fi
 
@@ -177,13 +232,13 @@ IMPORTANT: Use bash to write the file (step 5). Do NOT use the edit tool."
     if ! python3 -m py_compile train_ddp.py 2>/tmp/syntax_err.txt; then
         log "WARNING: syntax error in train_ddp.py — skipping."
         log "$(cat /tmp/syntax_err.txt)"
-        cp "$BASELINE" "$REPO_DIR/train_ddp.py"
+        cp "$BEST_CODE" "$REPO_DIR/train_ddp.py"
         continue
     fi
 
     # ── unchanged check ───────────────────────────────────────
-    if diff -q "$BASELINE" train_ddp.py > /dev/null 2>&1; then
-        log "WARNING: train_ddp.py unchanged from baseline — skipping."
+    if diff -q "$BEST_CODE" train_ddp.py > /dev/null 2>&1; then
+        log "WARNING: train_ddp.py unchanged from best code — skipping."
         continue
     fi
 
@@ -215,7 +270,7 @@ IMPORTANT: Use bash to write the file (step 5). Do NOT use the edit tool."
     if [ "$TRAIN_EXIT" -ne 0 ]; then
         CRASH_MSG=$(grep -m1 "Error:\|Traceback\|RuntimeError" run.log 2>/dev/null || echo "unknown")
         log "WARNING: Training CRASHED — reverting. Reason: $CRASH_MSG"
-        cp "$BASELINE" "$REPO_DIR/train_ddp.py"
+        cp "$BEST_CODE" "$REPO_DIR/train_ddp.py"
         sync_to_nodes "train_ddp.py"
         continue
     fi
@@ -228,7 +283,7 @@ IMPORTANT: Use bash to write the file (step 5). Do NOT use the edit tool."
     if [ -z "$VAL_AUC" ]; then
         log "WARNING: val_auc not found in run.log — skipping."
         log "Last 5 lines: $(tail -5 run.log | tr '\n' '|')"
-        cp "$BASELINE" "$REPO_DIR/train_ddp.py"
+        cp "$BEST_CODE" "$REPO_DIR/train_ddp.py"
         sync_to_nodes "train_ddp.py"
         continue
     fi
@@ -243,10 +298,16 @@ except: print('no')
     if [ "$BETTER" = "yes" ]; then
         STATUS="keep"
         log "NEW BEST — keeping $COMMIT ($EXP_FILE)."
+        # Update best code and best model weights for next iteration
+        cp train_ddp.py "$BEST_CODE"
+        cp "$REPO_DIR/trained_model.pth" "$REPO_DIR/best_model.pth" 2>/dev/null && {
+            sync_to_nodes "best_model.pth"
+            log "best_model.pth updated and synced."
+        } || log "WARNING: trained_model.pth not found — best_model.pth not updated."
     else
         STATUS="discard"
-        log "No improvement — baseline restored."
-        cp "$BASELINE" "$REPO_DIR/train_ddp.py"
+        log "No improvement — best code restored."
+        cp "$BEST_CODE" "$REPO_DIR/train_ddp.py"
         sync_to_nodes "train_ddp.py"
     fi
 

@@ -6,11 +6,20 @@ Metric: **val_auc** (mean AUC-ROC across 14 diseases). Higher is better.
 Target: Beat CheXNet benchmark of **0.841**.
 
 ## Rules
-- You may ONLY modify `train_ddp.py`
+- Use the **Edit tool** to modify ONLY code inside the EXPERIMENT section markers in `train_ddp.py`
 - `prepare.py` is fixed — do not touch it
-- DDP infrastructure is fixed — do not change `dist.init_process_group`, `DistributedSampler`, `dist.barrier()`
+- Everything outside the EXPERIMENT markers is DDP infrastructure — do NOT modify it
 - Training is 4-node DDP: each node has 1 GPU, WORLD_SIZE=4, global batch = 4 × per-node batch
 - Epochs per iteration are controlled by `MAX_EPOCHS` env var (set by loop_ddp.sh) — do NOT hardcode epochs
+- DO NOT rewrite the entire file — edit only the tagged sections
+
+## Editable sections (EXPERIMENT markers)
+| Section | Controls |
+|---|---|
+| `CLASSIFIER_HEAD` | Model architecture — add MLP head, dropout, attention pooling, unfreeze encoder |
+| `TRANSFORMS` | Data augmentation — PIL.Image input; **must** end with a tensor (BiomedCLIP preprocessor handles ToTensor) |
+| `OPTIMIZER` | Optimizer type, lr, weight_decay, scheduler, criterion / loss function |
+| `TRAIN_STEP` | Per-batch forward pass, loss computation, backward, grad clip, optimizer step (AMP goes here) |
 
 ## Baseline architecture (in train_ddp.py)
 - **BiomedCLIP** ViT-B/16 (`microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224`)
@@ -85,6 +94,42 @@ print(f'num_epochs:       {epoch}')
 print(f'world_size:       {world_size}')
 print(f'global_batch:     {global_batch}')
 ```
+
+---
+
+## CRITICAL — Optimizer parameter groups (differential LR)
+When splitting parameters into groups, ALWAYS use this exact pattern:
+```python
+# ✓ CORRECT — n and p are defined by the for clause first
+encoder_params = [p for n, p in model.named_parameters() if 'classifier' not in n]
+head_params    = [p for n, p in model.named_parameters() if 'classifier' in n]
+optimizer = torch.optim.AdamW([
+    {'params': encoder_params, 'lr': 1e-5},
+    {'params': head_params,    'lr': 1e-4},
+], weight_decay=1e-4)
+
+# ✗ WRONG — n is used before the for clause defines it (UnboundLocalError)
+encoder_params = [p for p in model.parameters() if 'classifier' not in n for n, p in model.named_parameters()]
+```
+
+### CRITICAL — Overlapping parameter groups crash with ValueError
+BiomedCLIP's visual encoder has an internal `.head` attribute. If your classifier is named
+`self.head`, then parameter names like `module.encoder.head.weight` contain BOTH 'encoder'
+AND 'head' — causing them to appear in two groups.
+
+```python
+# ✗ WRONG — BiomedCLIP encoder has internal .head, so 'encoder.head.*' matches both filters
+encoder_params = [p for n, p in model.named_parameters() if 'encoder' in n]
+head_params    = [p for n, p in model.named_parameters() if 'head' in n]
+# → ValueError: some parameters appear in more than one parameter group
+
+# ✓ CORRECT — use startswith or mutually exclusive filter
+head_params    = [p for n, p in model.named_parameters() if n.startswith('module.head')]
+encoder_params = [p for n, p in model.named_parameters() if not n.startswith('module.head')]
+```
+
+**Rule:** always make param group filters mutually exclusive. One group catches what the
+other misses — never let both conditions be true for the same parameter name.
 
 ---
 

@@ -17,3 +17,8 @@ analysis.ipynb
 # train_ddp.py is the baseline — never commit experiment-modified versions
 # Experiments are saved to experiments/iter-N.py by loop_ddp.sh
 train_ddp.py
+
+# Best model weights and best code — large files, managed by loop_ddp.sh
+best_model.pth
+trained_model.pth
+train_ddp.py.best
